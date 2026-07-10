@@ -147,6 +147,11 @@ def main() -> None:
                     help="[V2 model] SS7 reuse: multiply the --pairdelta-input rule_vec broadcast by the "
                          "encoder's own rule_confidence (was dead). Low-signal tasks shrink the hint "
                          "instead of feeding the norm growth that breaks MAIN-ON.")
+    ap.add_argument("--value-ctx-bind", action="store_true",
+                    help="[V2 model] D11/codex: 20 EXPLICIT product columns -- change_value[10] = "
+                         "P(change|src,ctx)*P(dst|src,ctx), copy_value[10] = P(copy|src,ctx)*one_hot(src). "
+                         "The linear evidence proj cannot multiply the D7 gate by the value dist itself; "
+                         "this hands it the finished recommendation. Zero-init, F7-safe.")
     ap.add_argument("--value-v2-aux-weight", type=float, default=0.0,
                     help="Explicit LODO loss on the VALUE-V2-only color_head contribution. This forces the "
                          "new evidence columns to become predictive instead of being ignored by the full "
@@ -428,6 +433,13 @@ def main() -> None:
     arch["c2_pairdelta_structure_evidence"] = bool(args.pairdelta_structure_evidence)
     arch["c2_pairdelta_bidi_evidence"] = bool(args.pairdelta_bidi_evidence)
     arch["c2_pairdelta_input_conf_gate"] = bool(args.pairdelta_input_conf_gate)
+    arch["c2_value_ctx_bind"] = bool(args.value_ctx_bind)
+    # D11 guard (codex): backoff silently wins over rich-ctx inside the model -- both on means the
+    # rich-ctx key is DEAD without a trace (the V3-1 silent-default disease). Refuse outright.
+    if args.value_v2_backoff and args.value_v2_rich_ctx:
+        raise SystemExit(
+            "[stage1 GATE] --value-v2-backoff and --value-v2-rich-ctx are BOTH set: backoff takes "
+            "precedence and rich-ctx would be silently dead. Pass exactly one (they are the A/B pair).")
     arch["c2_color_head_mlp_dim"] = int(args.color_mlp)
     arch["c2_quarantine_candidate"] = bool(args.quarantine_candidate)
     arch["c2_quarantine_hidden"] = int(args.quarantine_hidden)
@@ -1502,7 +1514,8 @@ def main() -> None:
         # pd/verified-frame/analogy coverage scalars were printed, so "did the evidence even fire on
         # the frozen batches" was unanswerable from the log. One line fixes that.
         if any(k in m for k in ("c2_pd_color_consensus_mass", "c2_pd_struct_conf",
-                                "c2_pd_bidi_invertibility", "c2_verified_frame_coverage")):
+                                "c2_pd_bidi_invertibility", "c2_verified_frame_coverage",
+                                "c2_value_ctx_bind_mass")):
             print(f"  PDEV  : consensus={g('c2_pd_color_consensus_mass'):.3f} "
                   f"minchg={g('c2_pd_color_min_change'):.3f} "
                   f"pos={g('c2_pd_color_pos_prior'):.3f} "
@@ -1511,7 +1524,8 @@ def main() -> None:
                   f"del={g('c2_pd_bidi_del_rate'):.3f} "
                   f"vframe_cov={g('c2_verified_frame_coverage'):.3f} "
                   f"analogy_cov={g('c2_analogy_coverage'):.3f} "
-                  f"in_conf={g('c2_pairdelta_input_conf'):.3f}")
+                  f"in_conf={g('c2_pairdelta_input_conf'):.3f} "
+                  f"bind={g('c2_value_ctx_bind_mass'):.3f}")
         if "c2_rule_hyp_norm" in m:
             print(f"  RULEHYP: norm={g('c2_rule_hyp_norm'):.4e} "
                   f"nonzero={g('c2_rule_hyp_nonzero_frac'):.3f}")

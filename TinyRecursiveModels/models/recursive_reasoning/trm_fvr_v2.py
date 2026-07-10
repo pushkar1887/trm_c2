@@ -113,6 +113,7 @@ EVIDENCE_COLS = (
     ("analogy",        11,                                                "c2_analogy_evidence"),         # D2 (E-2)
     ("pd_color",       PD_COLOR_DIM,                                      "c2_pairdelta_color_evidence"), # D8 (File #5)
     ("pd_bidi",        PD_BIDI_DIM,                                       "c2_pairdelta_bidi_evidence"),  # D10 (SS7)
+    ("value_ctx_bind", 20,                                                "c2_value_ctx_bind"),           # D11 (codex)
 )
 
 
@@ -277,6 +278,7 @@ class FVR_C2_Config(TinyRecursiveReasoningModel_ACTV1Config):
     c2_pairdelta_structure_evidence: bool = False  # D9 (File #5): verified extent-family masks -> zero-init [6->3] structure proj
     c2_pairdelta_bidi_evidence: bool = False  # D10 (SS7): y->x view (invertibility/deletion/dst-mass) -> 4 EvCol
     c2_pairdelta_input_conf_gate: bool = False  # SS7 reuse: gate the input rule_vec broadcast by rule_confidence
+    c2_value_ctx_bind: bool = False           # D11 (codex): explicit gate x value product columns -> 20 EvCol
 
 
 def _select_heads(hidden_size: int, requested_heads: int, max_heads: int) -> int:
@@ -934,7 +936,7 @@ class C2EvidenceMixin:
         device: torch.device,
         rel_maps: torch.Tensor | None = None,
         rel_where_hint: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor | None]:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor | None, torch.Tensor | None]:
         """Copy-vs-change and context-conditioned VALUE evidence [B, L, 36].
 
         Layout:
@@ -948,11 +950,14 @@ class C2EvidenceMixin:
         This is evidence only. It reads active LODO support when present and never reads target output
         to build features.
 
-        Returns (features, stats, ctx_gate). `ctx_gate` (D7, `c2_value_ctx_gate`) is a separate [B,L,2]
-        block -- P(change|src,ctx), P(copy|src,ctx) with source-marginal backoff -- or None when the
-        flag is off. It rides this method's EXISTING context pass (no duplicate signature compute, M3
-        spirit) and is deliberately NOT folded into `features`, so value_v2's 36 columns stay
-        byte-identical whether or not the gate is on (step-0 safety; the gate is its own EvCol block).
+        Returns (features, stats, ctx_gate, ctx_bind). `ctx_gate` (D7, `c2_value_ctx_gate`) is a
+        separate [B,L,2] block -- P(change|src,ctx), P(copy|src,ctx) with source-marginal backoff --
+        or None when its flag is off. `ctx_bind` (D11/codex, `c2_value_ctx_bind`) is a separate
+        [B,L,20] block of EXPLICIT gate x value products (change_value[10] | copy_value[10]): the
+        linear evidence proj can weight columns but never MULTIPLY them, so the finished
+        recommendation must arrive as a column. Both ride this method's EXISTING context pass (no
+        duplicate signature compute, M3 spirit) and are deliberately NOT folded into `features`, so
+        value_v2's 36 columns stay byte-identical whichever flags are on (each is its own EvCol block).
         """
         features = torch.zeros((batch_size, seq_len, VALUE_EVIDENCE_V2_DIM), device=device, dtype=torch.float32)
         zero_stats = {
@@ -965,12 +970,12 @@ class C2EvidenceMixin:
             "c2_value_v2_where_mass": torch.zeros((), device=device),
         }
         if batch is None:
-            return features, zero_stats, None
+            return features, zero_stats, None, None
         ci = batch.get("_active_context_inputs", batch.get("context_inputs"))
         co = batch.get("_active_context_outputs", batch.get("context_outputs"))
         ti = batch.get("inputs")
         if ci is None or co is None or ti is None or ti.ndim != 2:
-            return features, zero_stats, None
+            return features, zero_stats, None, None
         with torch.no_grad():
             x = ci.long().to(device)
             y = co.long().to(device)
@@ -1059,8 +1064,13 @@ class C2EvidenceMixin:
             # the copy/change RATES [20:22] are source-only. Whether a cell CHANGES AT ALL depends on
             # context (red-inside-box changes; red-in-bg copies). Reuses support_ctx/target_ctx +
             # valid/copied from THIS pass; only +2 scatter-adds (total + copy by a (ctx,src) key).
+            # D11 (codex): the BIND block rides the same gate math -- computed when EITHER flag is on,
+            # but each output block is emitted ONLY under its own flag (step-0 decoupling, D7 pattern).
             ctx_gate: torch.Tensor | None = None
-            if bool(getattr(self.config, "c2_value_ctx_gate", False)):
+            ctx_bind: torch.Tensor | None = None
+            _want_gate = bool(getattr(self.config, "c2_value_ctx_gate", False))
+            _want_bind = bool(getattr(self.config, "c2_value_ctx_bind", False))
+            if _want_gate or _want_bind:
                 csrc_key = (support_ctx * 10 + src).reshape(batch_size, -1)
                 gate_total = torch.zeros(
                     (batch_size, VALUE_EVIDENCE_V2_CONTEXT_BUCKETS * 10), device=device, dtype=torch.float32)
@@ -1075,7 +1085,18 @@ class C2EvidenceMixin:
                 p_copy_ctx = cop / tot.clamp_min(1.0)
                 p_change = g_alpha * p_change_ctx + (1.0 - g_alpha) * change_rate  # backoff to source-marginal rate
                 p_copy = g_alpha * p_copy_ctx + (1.0 - g_alpha) * copy_rate
-                ctx_gate = torch.stack((p_change, p_copy), dim=-1) * valid_target  # [B, L, 2]
+                if _want_gate:
+                    ctx_gate = torch.stack((p_change, p_copy), dim=-1) * valid_target  # [B, L, 2]
+                if _want_bind:
+                    # D11 (codex): EXPLICIT copy/change VALUE binding. color_evidence_proj is LINEAR --
+                    # it can weight the gate (2 cols) and the distribution (10 cols) but can never
+                    # MULTIPLY them; the finished recommendation must arrive as a column:
+                    #   change_value[10] = P(change|src,ctx) * P(dst|src,ctx)   (what it becomes, gated)
+                    #   copy_value[10]   = P(copy|src,ctx)   * one_hot(src)     (keep-as-is, gated)
+                    change_value = (p_change.unsqueeze(-1) * conditioned) * valid_target
+                    copy_value = (p_copy.unsqueeze(-1)
+                                  * F.one_hot(target_src, num_classes=10).to(torch.float32)) * valid_target
+                    ctx_bind = torch.cat((change_value, copy_value), dim=-1)       # [B, L, 20]
 
             stats = dict(zero_stats)
             labels = batch.get("labels")
@@ -1095,7 +1116,7 @@ class C2EvidenceMixin:
             stats["c2_value_v2_entropy_conf"] = entropy_conf[target >= 2].mean() if bool((target >= 2).any()) else torch.zeros((), device=device)
             stats["c2_value_v2_margin"] = margin[target >= 2].mean() if bool((target >= 2).any()) else torch.zeros((), device=device)
             stats["c2_value_v2_where_mass"] = features[..., 26:36].sum(dim=-1)[target >= 2].mean() if bool((target >= 2).any()) else torch.zeros((), device=device)
-        return features, stats, ctx_gate
+        return features, stats, ctx_gate, ctx_bind
 
 
 # ======================================================================================
@@ -1277,6 +1298,17 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             self.shape_h_head = CastedLinear(2 * self.config.hidden_size + _shape_extra, 30, bias=True)
             self.shape_w_head = CastedLinear(2 * self.config.hidden_size + _shape_extra, 30, bias=True)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+
+        # --- D11 guard (codex): backoff SILENTLY wins over rich-ctx in _value_context_signature
+        #     (checked first, returns early). Both on = rich-ctx dead without a trace -- the V3-1
+        #     silent-default disease. Warn loudly here; run_stage1_local refuses outright.
+        if (getattr(self.config, "c2_value_v2_backoff", False)
+                and getattr(self.config, "c2_value_v2_rich_ctx", False)):
+            import warnings
+            warnings.warn(
+                "c2_value_v2_backoff AND c2_value_v2_rich_ctx are both on: backoff takes precedence "
+                "and rich-ctx is silently DEAD. Pick one (this is the A/B variable).",
+                RuntimeWarning, stacklevel=2)
 
         # --- §15.0 V3-CLEAN INVARIANT GUARD (no behaviour change; surfaces config drift) ----------
         self._v3_clean_invariant_check()
@@ -2212,12 +2244,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         value_v2_stats: Dict[str, torch.Tensor] = {}
         value_v2_logits = None
         value_ctx_gate = None
-        # D7 needs value_v2's ctx pass even if the value_v2 COLUMNS themselves are off, so compute
-        # value_v2 when EITHER flag is on -- but only APPEND the 36 value_v2 columns under its own flag.
+        value_ctx_bind = None
+        # D7/D11 need value_v2's ctx pass even if the value_v2 COLUMNS themselves are off, so compute
+        # value_v2 when ANY of the flags is on -- but only APPEND each block under its own flag.
         _need_v2 = (getattr(self.config, "c2_value_evidence_v2", False)
-                    or getattr(self.config, "c2_value_ctx_gate", False))
+                    or getattr(self.config, "c2_value_ctx_gate", False)
+                    or getattr(self.config, "c2_value_ctx_bind", False))
         if _need_v2:
-            value_v2, value_v2_stats, value_ctx_gate = self._value_evidence_v2(
+            value_v2, value_v2_stats, value_ctx_gate, value_ctx_bind = self._value_evidence_v2(
                 batch, grid_z.shape[0], grid_z.shape[1], grid_z.device,
                 rel_maps=batch_rel_maps, rel_where_hint=rel_where_hint)
             if getattr(self.config, "c2_value_evidence_v2", False):
@@ -2256,6 +2290,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             pd_bidi, pd_bidi_stats = self._evidence_pd_bidi(
                 batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(pd_bidi.to(grid_z.dtype))
+        if getattr(self.config, "c2_value_ctx_bind", False):                                     # D11 (codex)
+            assert value_ctx_bind is not None, "c2_value_ctx_bind needs value_v2's ctx pass"
+            evidence_parts.append(value_ctx_bind.to(grid_z.dtype))
         ev = SimpleNamespace(
             task_palette=task_palette, use_palette_bias=use_palette_bias,
             rel_where_hint=rel_where_hint, pairdelta_intent_hint=pairdelta_intent_hint,
@@ -2263,7 +2300,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             value_v2_logits=value_v2_logits, algo_maps=algo_maps,
             value_ctx_gate=value_ctx_gate, verified_frame=verified_frame, analogy=analogy,
             pd_color=pd_color, pd_color_stats=pd_color_stats,
-            pd_bidi=pd_bidi, pd_bidi_stats=pd_bidi_stats)
+            pd_bidi=pd_bidi, pd_bidi_stats=pd_bidi_stats, value_ctx_bind=value_ctx_bind)
         return evidence_parts, ev
 
     def _color_logits(self, grid_z: torch.Tensor, evidence_parts: list, ev: SimpleNamespace) -> torch.Tensor:
@@ -2477,6 +2514,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             extras.update({f"c2_{k}": v.detach() for k, v in ev.pd_color_stats.items()})
         if ev.pd_bidi is not None:                                               # D10 (SS7)
             extras.update({f"c2_{k}": v.detach() for k, v in ev.pd_bidi_stats.items()})
+        if ev.value_ctx_bind is not None:                                        # D11 (codex)
+            extras["c2_value_ctx_bind_mass"] = ev.value_ctx_bind.abs().sum(-1).mean().detach()
         if pd_struct_conf is not None:                                           # D9 (File #5)
             extras["c2_pd_struct_conf"] = pd_struct_conf
         if q_logits is not None:
