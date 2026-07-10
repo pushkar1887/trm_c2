@@ -1,0 +1,45 @@
+# Python bytecode and test caches
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+**/.pytest_cache/
+
+# Local Python environments
+.venv/
+venv/
+TinyRecursiveModels/trm/
+
+# Local agent/editor state
+.agents/
+.claude/
+.codex/
+.superpowers/
+.vscode/
+.idea/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+*.pem
+*.key
+
+# Datasets, checkpoints, and generated outputs
+arc1concept-aug-1000/
+c2_VALID_005_EOS0_AUG1000_step673/
+TRM-FVR-Experiments/
+step_518071
+TinyRecursiveModels/checkpoints/
+TinyRecursiveModels/data/
+TinyRecursiveModels/outputs/
+TinyRecursiveModels/reports/
+
+# Third-party paper collection and generated logs
+aaai_papers/
+*.log
+*.tmp
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

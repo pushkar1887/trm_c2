@@ -1,0 +1,160 @@
+# Duplicated/molded from:
+#   D:/trm_c2/c2_VALID_005_EOS0_AUG1000_step673/all_config.yaml
+#
+# Purpose:
+#   Short checkpoint-saving V3 full-system test run.
+#   Uses TRM + C2 + relational maps + C2 demo relmaps + PairDelta input evidence
+#   + factored structure/color head + floor/candidate split.
+#
+# Run:
+#   .\trm\Scripts\python.exe pretrain.py --config-name cfg_v3_fullsystem_test
+
+hydra:
+  output_subdir: null
+
+disable_compile: true
+
+arch:
+  name: recursive_reasoning.trm_fvr_c2@TinyRecursiveReasoningModel_ACTV1
+  H_cycles: 3
+  H_layers: 0
+  L_cycles: 6
+  L_layers: 2
+  hidden_size: 512
+  expansion: 4
+  num_heads: 8
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+  halt_max_steps: 16
+  halt_exploration_prob: 0.1
+  no_ACT_continue: true
+  mlp_t: false
+
+  # C2/test-conditioned support path.
+  c2_enabled: true
+  c2_num_context: 3
+  c2_mode: test_conditioned
+  c2_heads: 4
+  c2_gate_init: 0.0
+  c2_use_cross_demo: true
+  c2_pid_dropout: 0.0
+  c2_leave_one_demo_weight: 0.0
+  c2_lodo_contrast_weight: 0.0
+  c2_lodo_contrast_margin: 0.05
+  c2_lodo_max_samples: 4
+  c2_use_change_features: true
+  c2_lodo_blank_pid: true
+  c2_lodo_force_build: true
+  c2_lodo_force_shuffle: false
+  c2_modulate_pid: true
+  c2_per_token_gate: false
+  c2_gate_dropout: 0.0
+  c2_gate_l2_weight: 0.0
+
+  # V3-clean output path: factored head is the output writer.
+  c2_dual_output_head: true
+  c2_geometry_aux_head: true
+  c2_shape_head: false
+  c2_shape_head_detach: true
+  c2_shape_pool: zH_puzzle_gridmean
+  c2_structure_fusion_alpha: 0.0
+
+  # Core prior / relation-map input evidence.
+  c2_relmap: true
+  c2_relmap_demos: true
+  c2_relmap_structure: true
+  c2_task_palette_feature: false
+  c2_task_palette_bias: false
+  c2_task_palette_strength: 4.0
+  c2_task_palette_hard: false
+  c2_rel_where_hint: false
+  c2_pairdelta_intent_hint: false
+  c2_transition_hint: false
+  c2_value_evidence_v2: false
+
+  # PairDelta as input-side evidence, not an output logit writer.
+  c2_pairdelta_input_feature: true
+
+  # Floor-safe candidate path: MAIN floor stays available; LODO trains candidate.
+  c2_floor_candidate_split: true
+  c2_candidate_floor_structure: true
+  c2_delta_expose_base_logits: true
+
+  # Keep old output-side delta writer off.
+  c2_delta_rule_branch: false
+  c2_delta_rule_logit_residual: false
+  c2_delta_rule_logit_replace: false
+  c2_color_prior: false
+  c2_color_prior_feature: false
+  c2_copy_structure_prior: false
+
+  loss:
+    name: losses_fvr@FVRACTLossHead
+    loss_type: stablemax_cross_entropy
+    gamma: 1.0
+    lambda_aux: 0.0
+    lam_hsic: 0.0
+    lam_cov: 0.0
+    lam_var: 0.0
+
+    # Do not make this test run chase PAD/EOS through the candidate.
+    c2_pad_loss_weight: 0.0
+    c2_boundary_pad_weight: 3.0
+    c2_shape_loss_weight: 0.0
+    c2_valid_mask_loss_weight: 0.0
+    c2_eos_loss_weight: 0.0
+    c2_changed_valid_loss_weight: 0.0
+
+    # Small LODO pressure on the candidate; preserve keeps floor-compatible behavior.
+    c2_delta_lodo_weight: 0.01
+    c2_delta_changed_weight: 5.0
+    c2_delta_color_weight: 1.0
+    c2_delta_pad_weight: 0.0
+    c2_delta_eos_weight: 0.0
+    c2_delta_contrast_weight: 0.0
+    c2_delta_preserve_weight: 1.0
+    c2_value_v2_aux_weight: 0.0
+    c2_value_v2_aux_changed_weight: 1.0
+    c2_value_v2_aux_copy_weight: 1.0
+
+data_paths:
+  - D:/trm_c2/arc1concept-aug-1000
+data_paths_test:
+  - data/arc-agi-evaluation-full400-seed0-pid401aligned
+
+evaluators:
+  - name: arc@ARC
+eval_save_outputs: []
+
+dataloader_num_workers: 0
+dataloader_prefetch_factor: 8
+dataloader_pin_memory: true
+dataloader_persistent_workers: false
+
+global_batch_size: 4
+epochs: 3
+eval_interval: 1
+checkpoint_every_eval: true
+min_eval_interval: 0
+
+load_checkpoint: D:/trm_c2/step_518071
+checkpoint_path: D:/trm_c2/TinyRecursiveModels/checkpoints/TRM-FVR-Experiments/v3_fullsystem_test_e3_b4
+project_name: TRM-FVR-Experiments
+run_name: v3_fullsystem_test_e3_b4
+
+optimizer: adamw
+lr: 1.0e-6
+lr_min_ratio: 1.0
+lr_warmup_steps: 20
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.01
+puzzle_emb_lr: 1.0e-4
+puzzle_emb_weight_decay: 0.01
+
+ema: false
+ema_rate: 0.999
+freeze_weights: false
+seed: 0

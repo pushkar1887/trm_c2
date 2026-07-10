@@ -1,0 +1,98 @@
+# V2 base config for scripts/run_stage1_local.py --config config/stage1_local_v2_base.yaml
+#
+# COPY of checkpoints/TRM-FVR-Experiments/c2_geomaux_VALID_005_EOS0_AUG1000_step670_evalfull400_pid401/
+# all_config.yaml with EXACTLY three intentional diffs:
+#   1. arch.name -> recursive_reasoning.trm_fvr_v2 (the File #4 rewrite; step-0 byte-identical to
+#      trm_fvr_c2 at these flags -- proven by scripts/step0_identity_harness.py, blocks 0-8).
+#   2. run_name / checkpoint_path -> v2-suffixed so artifacts never collide with the old run's.
+#   3. This header.
+# Everything else (loss head losses_fvr@FVRACTLossHead, lrs, 518K load_checkpoint, batch, ACT) is
+# byte-identical. NOTE the yaml still pins c2_dual_output_head: false (the V3-1 silent-kill) --
+# run_stage1_local's --v3-clean (default on) overrides it at runtime, same as with the old model.
+# The V2-only evidence flags (c2_verified_frame_evidence / c2_analogy_evidence / c2_value_ctx_gate /
+# c2_value_v2_backoff) are NOT set here: they default off in FVR_C2_Config and are switched per-run
+# by the new run_stage1_local args (--verified-frame-evidence etc.).
+arch:
+  name: recursive_reasoning.trm_fvr_v2@TinyRecursiveReasoningModel_ACTV1
+  H_cycles: 3
+  H_layers: 0
+  L_cycles: 6
+  L_layers: 2
+  hidden_size: 512
+  expansion: 4
+  num_heads: 8
+  pos_encodings: rope
+  forward_dtype: bfloat16
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+  halt_max_steps: 16
+  halt_exploration_prob: 0.1
+  no_ACT_continue: true
+  mlp_t: false
+  c2_enabled: true
+  c2_num_context: 3
+  c2_mode: test_conditioned
+  c2_heads: 4
+  c2_gate_init: 0.0
+  c2_use_cross_demo: true
+  c2_pid_dropout: 0.0
+  c2_leave_one_demo_weight: 0.0
+  c2_lodo_contrast_weight: 0.0
+  c2_lodo_contrast_margin: 0.05
+  c2_lodo_max_samples: 4
+  c2_use_change_features: true
+  c2_lodo_blank_pid: false
+  c2_modulate_pid: true
+  c2_per_token_gate: false
+  c2_gate_dropout: 0.0
+  c2_gate_l2_weight: 0.0
+  c2_dual_output_head: false
+  c2_geometry_aux_head: true
+  c2_shape_head: false
+  c2_shape_head_detach: true
+  c2_shape_pool: zH_puzzle_gridmean
+  loss:
+    name: losses_fvr@FVRACTLossHead
+    loss_type: stablemax_cross_entropy
+    gamma: 1.0
+    lambda_aux: 0.0
+    lam_hsic: 0.0
+    lam_cov: 0.0
+    lam_var: 0.0
+    c2_pad_loss_weight: 0.02
+    c2_boundary_pad_weight: 3.0
+    c2_shape_loss_weight: 0.0
+    c2_valid_mask_loss_weight: 0.005
+    c2_eos_loss_weight: 0.0
+data_paths:
+- data/arc-agi-evaluation-full400-seed0
+data_paths_test: []
+global_batch_size: 8
+epochs: 1
+eval_interval: 1
+min_eval_interval: 0
+checkpoint_every_eval: false
+load_checkpoint: D:\trm_c2\step_518071
+checkpoint_path: D:\trm_c2\TinyRecursiveModels\checkpoints\TRM-FVR-Experiments\v2_model_stage1_local
+project_name: TRM-FVR-Experiments
+run_name: v2_model_stage1_local
+evaluators:
+- name: arc@ARC
+eval_save_outputs: []
+dataloader_num_workers: 0
+dataloader_prefetch_factor: 8
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+beta1: 0.9
+beta2: 0.95
+optimizer: AdamW
+lr: 1.0e-05
+lr_min_ratio: 1.0
+lr_warmup_steps: 20
+weight_decay: 0.01
+puzzle_emb_lr: 0.001
+puzzle_emb_weight_decay: 0.01
+ema: false
+ema_rate: 0.999
+freeze_weights: false
+seed: 0

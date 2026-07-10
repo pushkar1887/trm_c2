@@ -1,0 +1,56 @@
+# TRM-first FVR experiment config.
+#
+# Use this entrypoint for staged FVR work:
+#   python pretrain.py --config-name cfg_fvr_experiment arch=trm_fvr_c2
+#   python pretrain.py --config-name cfg_fvr_experiment arch=trm_fvr_kstream arch.K=2
+#
+# Vanilla TRM remains available through cfg_pretrain.yaml and arch=trm.
+
+defaults:
+  - arch: trm_fvr_c2
+  - _self_
+
+hydra:
+  output_subdir: null
+
+data_paths: ['data/arc-aug-1000']
+data_paths_test: []
+
+dataloader_num_workers: 1
+dataloader_prefetch_factor: 8
+dataloader_pin_memory: True
+dataloader_persistent_workers: True
+
+evaluators:
+  - name: arc@ARC
+
+global_batch_size: 128
+
+epochs: 1000
+eval_interval: 100
+checkpoint_every_eval: True
+
+lr: 1e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 200
+
+beta1: 0.9
+beta2: 0.95
+optimizer: adamw
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+puzzle_emb_lr: 1e-2
+
+seed: 0
+min_eval_interval: 0
+
+ema: False
+ema_rate: 0.999
+freeze_weights: False
+
+project_name: TRM-FVR-Experiments
+run_name: null
+load_checkpoint: null
+checkpoint_path: null
+
+eval_save_outputs: []

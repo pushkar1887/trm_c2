@@ -1,0 +1,94 @@
+name: recursive_reasoning.trm_fvr_v2@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses_fvr@FVRACTLossHead
+  loss_type: stablemax_cross_entropy
+  lambda_aux: 0.0
+  lam_hsic: 0.0
+  lam_cov: 0.0
+  lam_var: 0.0
+  gamma: 1.0
+  c2_shape_loss_weight: 0.0
+  c2_pad_loss_weight: 0.0
+  c2_boundary_pad_weight: 3.0
+  c2_valid_mask_loss_weight: 0.0
+  c2_eos_loss_weight: 0.0
+  c2_changed_valid_loss_weight: 0.0
+  c2_value_v2_aux_weight: 0.0
+  c2_value_v2_aux_changed_weight: 1.0
+  c2_value_v2_aux_copy_weight: 1.0
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False
+puzzle_emb_len: 16
+no_ACT_continue: True
+
+c2_enabled: True
+c2_num_context: 3
+c2_mode: test_conditioned
+c2_heads: 4
+c2_gate_init: 0.0
+c2_use_cross_demo: True
+c2_pid_dropout: 0.0
+c2_leave_one_demo_weight: 0.0
+c2_lodo_contrast_weight: 0.0
+c2_lodo_contrast_margin: 0.05
+c2_lodo_max_samples: 4
+c2_use_change_features: True
+c2_lodo_blank_pid: False
+# Stage 1 architecture flags. Default off so vanilla C2 path is unchanged.
+# Enable on the run command line to activate Stage 1 behavior.
+c2_modulate_pid: False
+c2_per_token_gate: False
+c2_gate_dropout: 0.0
+c2_gate_l2_weight: 0.0
+c2_dual_output_head: False
+c2_geometry_aux_head: False
+c2_task_palette_feature: False
+c2_task_palette_bias: False
+c2_task_palette_strength: 4.0
+c2_task_palette_hard: False
+c2_rel_where_hint: False
+c2_pairdelta_intent_hint: False
+c2_transition_hint: False
+c2_value_evidence_v2: False
+c2_shape_head: False
+c2_shape_head_detach: True
+c2_shape_pool: zH_puzzle_gridmean
+c2_structure_fusion_alpha: 0.0
+c2_color_residual_head: False
+c2_color_residual_gate_init: 0.0
+c2_color_residual_zero_init: False
+# Frozen visual cache branch. Default off; gate 0.0 is an exact no-op.
+c2_visual_encoder: False
+c2_visual_cache_path: null
+c2_visual_model_name: null
+c2_visual_gate_init: 0.0
+c2_visual_feature_dim: 1024
+c2_visual_project_dim: 512
+c2_visual_cache_level: dino_patch_16x16
+# Frozen pooled SigLIP-B demo-delta rule adapter. Separate from patch cache.
+c2_visual_rule_adapter: False
+c2_visual_encoder_name: google/siglip-base-patch16-224
+c2_visual_mode: pooled_demo_delta_symbolic
+c2_visual_rule_dim: 256
+c2_visual_use_query_output: False
+# Explicit structural rule branch. Default off for clean ablations.
+c2_use_struct_rule_branch: False
+c2_struct_rule_gate_init: 0.0
