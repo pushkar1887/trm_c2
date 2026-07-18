@@ -20,6 +20,85 @@ def _loss_per_token(loss_type: str, logits: torch.Tensor, labels: torch.Tensor, 
     raise ValueError(f"Unknown loss_type={loss_type!r}")
 
 
+def _loss_component_health(components: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, object]]:
+    """Summarize scalar loss components without hiding the term that became non-finite."""
+    values: Dict[str, float] = {}
+    nonfinite: Dict[str, str] = {}
+    for name, value in components.items():
+        if not torch.is_tensor(value) or value.numel() != 1:
+            raise ValueError(f"loss component {name!r} must be a scalar tensor")
+        scalar = float(value.detach().to(torch.float64).item())
+        values[name] = scalar
+        if math.isnan(scalar):
+            nonfinite[name] = "nan"
+        elif scalar == float("inf"):
+            nonfinite[name] = "+inf"
+        elif scalar == -float("inf"):
+            nonfinite[name] = "-inf"
+    return {"values": values, "nonfinite": nonfinite}
+
+
+def _tensor_health(value: torch.Tensor) -> Dict[str, object]:
+    """Compact NaN/Inf/range report for one tensor, evaluated only on a failure path."""
+    x = value.detach().to(torch.float64)
+    finite_mask = torch.isfinite(x)
+    finite_values = x[finite_mask]
+    if finite_values.numel() > 0:
+        finite_min = float(finite_values.min().item())
+        finite_max = float(finite_values.max().item())
+        finite_abs_max = float(finite_values.abs().max().item())
+    else:
+        finite_min = finite_max = finite_abs_max = None
+    return {
+        "shape": tuple(value.shape),
+        "dtype": str(value.dtype),
+        "numel": int(value.numel()),
+        "finite": int(finite_mask.sum().item()),
+        "nan": int(torch.isnan(x).sum().item()),
+        "posinf": int(torch.isposinf(x).sum().item()),
+        "neginf": int(torch.isneginf(x).sum().item()),
+        "finite_min": finite_min,
+        "finite_max": finite_max,
+        "finite_abs_max": finite_abs_max,
+    }
+
+
+def _numerical_failure_message(
+    kind: str,
+    components: Dict[str, torch.Tensor],
+    outputs: Dict[str, torch.Tensor],
+    model: nn.Module,
+) -> str:
+    """Build the expensive forensic report only after a non-finite scalar is detected."""
+    component_health = _loss_component_health(components)
+    critical_keys = (
+        "logits",
+        "c2_color_logits",
+        "c2_candidate_logits",
+        "c2_aux_logits",
+        "c2_aux_base_logits",
+        "c2_aux_canonical_bind_base_logits",
+        "c2_aux_canonical_bind_logits",
+    )
+    tensor_health = {
+        key: _tensor_health(outputs[key])
+        for key in critical_keys
+        if key in outputs and torch.is_tensor(outputs[key])
+    }
+    bad_parameters: Dict[str, Dict[str, object]] = {}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        health = _tensor_health(parameter)
+        if health["nan"] or health["posinf"] or health["neginf"]:
+            bad_parameters[name] = health
+    return (
+        f"{kind}; nonfinite_components={component_health['nonfinite']}; "
+        f"all_components={component_health['values']}; critical_tensors={tensor_health}; "
+        f"bad_trainable_parameters={bad_parameters}"
+    )
+
+
 def _context_labels_to_loss_labels(labels: torch.Tensor) -> torch.Tensor:
     return torch.where(labels == 0, torch.full_like(labels, IGNORE_LABEL_ID), labels)
 
@@ -106,6 +185,497 @@ def _value_v2_aux_ce(logits: torch.Tensor, target: torch.Tensor, inputs: torch.T
         changed_acc = ((pred == t) & changed).float().sum() / changed.float().sum().clamp_min(1.0)
         copy_acc = ((pred == t) & copied).float().sum() / copied.float().sum().clamp_min(1.0)
     return changed_w * loss_changed + copy_w * loss_copy, loss_changed, loss_copy, changed_acc, copy_acc
+
+
+def _value_ctx_bind_aux_ce(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    inputs: torch.Tensor,
+    support_mask: torch.Tensor,
+    changed_w: float,
+    copy_w: float,
+):
+    """Colour CE on the value_ctx_bind evidence slice, only where support supplied a binding."""
+    t = target.long()
+    supported = support_mask.to(device=t.device, dtype=torch.bool)
+    keep = (t >= 2) & supported
+    inp = inputs.long()
+    changed = keep & (inp != t)
+    copied = keep & (inp == t)
+    color_target = (t - 2).clamp(0, 9)
+    ce = F.cross_entropy(logits.reshape(-1, 10).float(), color_target.reshape(-1), reduction="none").view_as(t)
+
+    def cm(mask_: torch.Tensor) -> torch.Tensor:
+        mask_f = mask_.float()
+        return (ce * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+    loss_changed = cm(changed)
+    loss_copy = cm(copied)
+    with torch.no_grad():
+        pred = logits.argmax(dim=-1) + 2
+        pred_ok = pred == t
+        changed_acc = (pred_ok & changed).float().sum() / changed.float().sum().clamp_min(1.0)
+        copy_acc = (pred_ok & copied).float().sum() / copied.float().sum().clamp_min(1.0)
+        coverage = keep.float().sum() / (t >= 2).float().sum().clamp_min(1.0)
+        # PER-EXAMPLE (per-row) views for paired analysis + mechanism-conditioned exact. [B] tensors,
+        # ignored by the scalar-only panel aggregators (numel!=1); NEVER scaled by metric_count.
+        # An EMPTY subset is UNDEFINED, not perfect: a row with no supported changed cells must be
+        # NaN (excluded from paired means / mechanism eligibility), never acc=0 + exact=1.
+        changed_n = changed.float().sum(-1)
+        copied_n = copied.float().sum(-1)
+        colour_n = (t >= 2).float().sum(-1)
+        _nan = torch.full_like(changed_n, float("nan"))
+        per_ex = {
+            "c2_bind_changed_acc_per_ex": torch.where(
+                changed_n > 0, (pred_ok & changed).float().sum(-1) / changed_n.clamp_min(1.0), _nan),
+            "c2_bind_copy_acc_per_ex": torch.where(
+                copied_n > 0, (pred_ok & copied).float().sum(-1) / copied_n.clamp_min(1.0), _nan),
+            "c2_bind_support_coverage_per_ex": torch.where(
+                colour_n > 0, keep.float().sum(-1) / colour_n.clamp_min(1.0), _nan),
+            "c2_bind_changed_exact_per_ex": torch.where(
+                changed_n > 0, (pred_ok | ~changed).all(-1).float(), _nan),
+            "c2_bind_copy_exact_per_ex": torch.where(
+                copied_n > 0, (pred_ok | ~copied).all(-1).float(), _nan),
+        }
+    total = changed_w * loss_changed + copy_w * loss_copy
+    return total, loss_changed, loss_copy, changed_acc, copy_acc, coverage, per_ex
+
+
+def _p1_value_extraction_metrics(
+    base_logits: torch.Tensor,
+    distribution: torch.Tensor,
+    marginal_distribution: torch.Tensor,
+    target: torch.Tensor,
+    inputs: torch.Tensor,
+    changed_supported: torch.Tensor,
+    copy_supported: torch.Tensor,
+    support_reliability: torch.Tensor,
+    same_position_route: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """P1 VALUE-extraction diagnostics: does the canonical binder EXTRACT the correct colour,
+    measured training-free against the deployment base prediction (colour head minus binder
+    residual). All outputs are per-example [B] tensors; empty subsets are NaN, never zero.
+
+    `claim` is SUPPORT-DERIVED ONLY -- it never inspects whether the target cell actually changed,
+    so `fixed_replacement_*` measures a deployable rule, not an oracle. `same_position_route` is
+    part of the received contract but deliberately unused in the math: route is applicability
+    confidence and P1 measures extraction, not delivery."""
+    del same_position_route
+    with torch.no_grad():
+        t = target.long()
+        inp = inputs.long()
+        valid = (t >= 2) & (inp >= 2)
+        changed = valid & (t != inp)
+        copied = valid & (t == inp)
+        chg_supported = changed_supported.bool()
+        cpy_supported = copy_supported.bool()
+        chg_sup = changed & chg_supported
+        cpy_sup = copied & cpy_supported
+        raw_ok = (distribution.argmax(dim=-1) + 2) == t
+        marg_ok = (marginal_distribution.argmax(dim=-1) + 2) == t
+        base_ok = (base_logits.float().argmax(dim=-1) + 2) == t
+        claim = valid & (chg_supported | cpy_supported)
+        repl_ok = torch.where(claim, raw_ok, base_ok)
+
+        def _frac(ok: torch.Tensor, subset: torch.Tensor) -> torch.Tensor:
+            den = subset.float().sum(-1)
+            val = (ok & subset).float().sum(-1) / den.clamp_min(1.0)
+            return torch.where(den > 0, val, torch.full_like(den, float("nan")))
+
+        rel = support_reliability.float()
+        chg_n = changed.float().sum(-1)
+        cpy_n = copied.float().sum(-1)
+        nan_b = torch.full_like(chg_n, float("nan"))
+        eff_chg = torch.where(
+            chg_n > 0,
+            (changed.float() * chg_supported.float() * rel).sum(-1) / chg_n.clamp_min(1.0), nan_b)
+        eff_cpy = torch.where(
+            cpy_n > 0,
+            (copied.float() * cpy_supported.float() * rel).sum(-1) / cpy_n.clamp_min(1.0), nan_b)
+        top2 = distribution.float().topk(2, dim=-1).values
+        margin_cell = top2[..., 0] - top2[..., 1]
+        chg_sup_n = chg_sup.float().sum(-1)
+        raw_margin = torch.where(
+            chg_sup_n > 0, (margin_cell * chg_sup.float()).sum(-1) / chg_sup_n.clamp_min(1.0), nan_b)
+        # Contract failures counted on ALL valid cells (P3A Block 0), not only claimed ones: the
+        # binder guarantees a finite simplex summing to 1 on every valid target cell (empty support
+        # backs off to the pure-copy K0 prior), so a broken simplex anywhere valid is a defect even
+        # when no support claimed the cell. Both the posterior and the K0 marginal are checked.
+        # Invalid cells stay all-zero by design and are exempt.
+        dist_finite = torch.isfinite(distribution).all(dim=-1)
+        marg_finite = torch.isfinite(marginal_distribution).all(dim=-1)
+        both_finite = dist_finite & marg_finite
+        finite_fail = (~both_finite) & valid
+        norm_bad = (
+            ((distribution.float().sum(dim=-1) - 1.0).abs() > 1e-6)
+            | ((marginal_distribution.float().sum(dim=-1) - 1.0).abs() > 1e-6)
+        )
+        norm_fail = norm_bad & valid & both_finite
+        return {
+            "p1_raw_bind_changed_acc_per_ex": _frac(raw_ok, chg_sup),
+            "p1_raw_bind_copy_acc_per_ex": _frac(raw_ok, cpy_sup),
+            "p1_effective_changed_coverage_per_ex": eff_chg,
+            "p1_effective_copy_coverage_per_ex": eff_cpy,
+            "p1_raw_bind_margin_per_ex": raw_margin,
+            "p1_marginal_bind_changed_acc_per_ex": _frac(marg_ok, chg_sup),
+            "p1_fixed_replacement_gain_per_ex": _frac(repl_ok, changed) - _frac(base_ok, changed),
+            "p1_fixed_replacement_copy_loss_per_ex": _frac(base_ok, copied) - _frac(repl_ok, copied),
+            "p1_norm_fail_per_ex": norm_fail.float().sum(-1),
+            "p1_finite_fail_per_ex": finite_fail.float().sum(-1),
+            "p1_changed_supported_cells_per_ex": chg_sup_n,
+        }
+
+
+def _canonical_bind_residual_ce(
+    base_logits: torch.Tensor,
+    bind_logits: torch.Tensor,
+    target: torch.Tensor,
+    inputs: torch.Tensor,
+    changed_support: torch.Tensor,
+    copy_support: torch.Tensor,
+    changed_w: float,
+) -> Dict[str, torch.Tensor | Dict[str, torch.Tensor]]:
+    """Train canonical VALUE as the residual it is at inference.
+
+    ``base_logits`` is the current candidate colour path with the canonical bind contribution
+    removed. It is detached here: Repair B teaches only the existing bind slice to correct that
+    candidate. Copy cells are measured but deliberately excluded from this auxiliary objective;
+    the ordinary LODO copy/preservation terms remain their authority.
+    """
+    if base_logits.shape != bind_logits.shape or base_logits.shape[-1] != 10:
+        raise ValueError("canonical base/bind logits must have the same [B,L,10] shape")
+    if changed_support.shape != target.shape or copy_support.shape != target.shape:
+        raise ValueError("canonical changed/copy support masks must match [B,L] targets")
+
+    t = target.long()
+    inp = inputs.long()
+    valid = (t >= 2) & (inp >= 2)
+    true_changed = valid & (inp != t)
+    true_copy = valid & (inp == t)
+    changed = true_changed & changed_support.to(device=t.device, dtype=torch.bool)
+    copied = true_copy & copy_support.to(device=t.device, dtype=torch.bool)
+    color_target = (t - 2).clamp(0, 9)
+
+    base = base_logits.detach().float()
+    residual = bind_logits.float()
+    combined = base + residual
+    ce = F.cross_entropy(
+        combined.reshape(-1, 10), color_target.reshape(-1), reduction="none").view_as(t)
+
+    def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_f = mask.float()
+        return (values * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+    changed_ce = masked_mean(ce, changed)
+    # Diagnostic only. This term is intentionally absent from ``loss``.
+    copy_ce = masked_mean(ce, copied)
+    loss = float(changed_w) * changed_ce
+
+    with torch.no_grad():
+        base_pred = base.argmax(dim=-1)
+        final_pred = combined.argmax(dim=-1)
+        target_class = color_target
+        final_ok = final_pred == target_class
+        base_ok = base_pred == target_class
+
+        changed_n = changed.float().sum()
+        copied_n = copied.float().sum()
+        valid_n = valid.float().sum().clamp_min(1.0)
+        true_changed_n = true_changed.float().sum().clamp_min(1.0)
+        true_copy_n = true_copy.float().sum().clamp_min(1.0)
+        base_correct_copy = copied & base_ok
+        base_correct_copy_n = base_correct_copy.float().sum().clamp_min(1.0)
+
+        changed_acc = (final_ok & changed).float().sum() / changed_n.clamp_min(1.0)
+        copy_acc = (final_ok & copied).float().sum() / copied_n.clamp_min(1.0)
+        support_coverage = (changed | copied).float().sum() / valid_n
+        changed_support_coverage = changed_n / true_changed_n
+        copy_support_coverage = copied_n / true_copy_n
+
+        target_base = base.gather(-1, target_class.unsqueeze(-1)).squeeze(-1)
+        competitor_base = base.masked_fill(
+            F.one_hot(target_class, num_classes=10).bool(),
+            torch.finfo(base.dtype).min,
+        ).amax(dim=-1)
+        base_wrong_margin = masked_mean(competitor_base - target_base, changed)
+        residual_norm = masked_mean(residual.norm(dim=-1), changed | copied)
+        corrected_changed_frac = (
+            ((~base_ok) & final_ok & changed).float().sum() / changed_n.clamp_min(1.0))
+        caused_copy_flip_frac = (
+            (base_correct_copy & ~final_ok).float().sum() / base_correct_copy_n)
+
+        changed_per_row = changed.float().sum(-1)
+        copied_per_row = copied.float().sum(-1)
+        valid_per_row = valid.float().sum(-1)
+        true_changed_per_row = true_changed.float().sum(-1)
+        true_copy_per_row = true_copy.float().sum(-1)
+        base_correct_copy_per_row = base_correct_copy.float().sum(-1)
+        nan = torch.full_like(changed_per_row, float("nan"))
+        per_ex = {
+            "c2_bind_changed_acc_per_ex": torch.where(
+                changed_per_row > 0,
+                (final_ok & changed).float().sum(-1) / changed_per_row.clamp_min(1.0), nan),
+            "c2_bind_copy_acc_per_ex": torch.where(
+                copied_per_row > 0,
+                (final_ok & copied).float().sum(-1) / copied_per_row.clamp_min(1.0), nan),
+            "c2_bind_support_coverage_per_ex": torch.where(
+                valid_per_row > 0,
+                (changed | copied).float().sum(-1) / valid_per_row.clamp_min(1.0), nan),
+            "c2_bind_changed_support_coverage_per_ex": torch.where(
+                true_changed_per_row > 0,
+                changed_per_row / true_changed_per_row.clamp_min(1.0), nan),
+            "c2_bind_copy_support_coverage_per_ex": torch.where(
+                true_copy_per_row > 0,
+                copied_per_row / true_copy_per_row.clamp_min(1.0), nan),
+            "c2_bind_changed_exact_per_ex": torch.where(
+                changed_per_row > 0, (final_ok | ~changed).all(-1).float(), nan),
+            "c2_bind_copy_exact_per_ex": torch.where(
+                copied_per_row > 0, (final_ok | ~copied).all(-1).float(), nan),
+            "c2_bind_corrected_changed_frac_per_ex": torch.where(
+                changed_per_row > 0,
+                ((~base_ok) & final_ok & changed).float().sum(-1) / changed_per_row.clamp_min(1.0), nan),
+            "c2_bind_caused_copy_flip_frac_per_ex": torch.where(
+                base_correct_copy_per_row > 0,
+                (base_correct_copy & ~final_ok).float().sum(-1)
+                / base_correct_copy_per_row.clamp_min(1.0), nan),
+        }
+
+    return {
+        "loss": loss,
+        "changed_ce": changed_ce,
+        "copy_ce": copy_ce,
+        "changed_acc": changed_acc,
+        "copy_acc": copy_acc,
+        "support_coverage": support_coverage,
+        "changed_support_coverage": changed_support_coverage,
+        "copy_support_coverage": copy_support_coverage,
+        "base_wrong_margin": base_wrong_margin,
+        "residual_norm": residual_norm,
+        "corrected_changed_frac": corrected_changed_frac,
+        "caused_copy_flip_frac": caused_copy_flip_frac,
+        "per_ex": per_ex,
+    }
+
+
+def _where_metrics_per_task(
+    gate_values: torch.Tensor,
+    target: torch.Tensor,
+    inputs: torch.Tensor,
+    row_valid: torch.Tensor | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Task-balanced WHERE diagnostics and proper-selector loss terms.
+
+    The old panel exposed a single cell-micro F1. ARC scores tasks equally, so a large
+    canvas must not outweigh a small task. This helper returns both contracts explicitly.
+    Rows without changed cells stay visible in FPR/copy metrics but are excluded from
+    ``macro_f1`` because their positive-class F1 is undefined.
+    """
+    q = gate_values.float()
+    if not bool(torch.isfinite(q).all()):
+        bad = int((~torch.isfinite(q)).sum().item())
+        raise FloatingPointError(f"positive WHERE selector contains {bad} non-finite values")
+    if bool(((q < 0.0) | (q > 1.0)).any()):
+        raise ValueError(
+            f"positive WHERE selector must be in [0,1], got min={float(q.min()):.6g} "
+            f"max={float(q.max()):.6g}")
+    t = target.long()
+    valid = t >= 2
+    if row_valid is not None:
+        valid = valid & row_valid.to(device=t.device, dtype=torch.bool).view(-1, 1)
+    changed = valid & (inputs.long() != t)
+    copied = valid & ~changed
+    pred = (q > 0.5) & valid
+    # Block 2: per-row exact WHERE mask -- q>=0.5 must equal the true changed/copy split on EVERY valid
+    # cell. This is the WHERE half of mechanism-conditioned exactness (bridge from per-cell to per-grid).
+    where_mask_exact = (((q >= 0.5) == changed) | ~valid).all(dim=1)
+
+    tp = (pred & changed).sum(dim=1).float()
+    fp = (pred & copied).sum(dim=1).float()
+    fn = ((~pred) & changed).sum(dim=1).float()
+    changed_n = changed.sum(dim=1).float()
+    copied_n = copied.sum(dim=1).float()
+    f1_per_task = 2.0 * tp / (2.0 * tp + fp + fn).clamp_min(1.0)
+    fpr_per_task = fp / copied_n.clamp_min(1.0)
+    has_changed = changed_n > 0
+    has_copy = copied_n > 0
+
+    macro_f1 = (
+        f1_per_task[has_changed].mean()
+        if bool(has_changed.any()) else torch.zeros((), device=q.device)
+    )
+    macro_fpr = (
+        fpr_per_task[has_copy].mean()
+        if bool(has_copy.any()) else torch.zeros((), device=q.device)
+    )
+    tp_all, fp_all, fn_all = tp.sum(), fp.sum(), fn.sum()
+    micro_f1 = 2.0 * tp_all / (2.0 * tp_all + fp_all + fn_all).clamp_min(1.0)
+    micro_fpr = fp_all / copied_n.sum().clamp_min(1.0)
+
+    eps = 1e-6
+    q_safe = q.clamp(eps, 1.0 - eps)
+    pos_bce = -(torch.log(q_safe) * changed.float()).sum(dim=1) / changed_n.clamp_min(1.0)
+    neg_bce = -(torch.log1p(-q_safe) * copied.float()).sum(dim=1) / copied_n.clamp_min(1.0)
+    copy_mean = (q * copied.float()).sum(dim=1) / copied_n.clamp_min(1.0)
+    proper_loss_per_task = 0.5 * pos_bce + 0.5 * neg_bce + 0.25 * copy_mean
+    # Copy-only tasks are valid negative WHERE supervision: they must train q toward zero instead
+    # of disappearing from the objective. Macro positive-class F1 still excludes them because that
+    # metric is undefined when there are no changed cells.
+    active_rows = valid.any(dim=1)
+    proper_loss = (
+        proper_loss_per_task[active_rows].mean()
+        if bool(active_rows.any()) else torch.zeros((), device=q.device)
+    )
+    return {
+        "f1_per_task": f1_per_task,
+        "fpr_per_task": fpr_per_task,
+        "has_changed": has_changed,
+        "has_copy": has_copy,
+        "macro_f1": macro_f1,
+        "macro_fpr": macro_fpr,
+        "micro_f1": micro_f1,
+        "micro_fpr": micro_fpr,
+        "proper_loss_per_task": proper_loss_per_task,
+        "proper_loss": proper_loss,
+        "positive_bce_per_task": pos_bce,
+        "negative_bce_per_task": neg_bce,
+        "copy_mean_per_task": copy_mean,
+        "changed_mask": changed,
+        "copied_mask": copied,
+        "where_mask_exact": where_mask_exact,
+    }
+
+
+def _gate_where_objective(
+    gate_values: torch.Tensor,
+    target: torch.Tensor,
+    inputs: torch.Tensor,
+    row_valid: torch.Tensor | None = None,
+    positive_selector: bool = False,
+):
+    """Tanh-gate WHERE objective and diagnostics on valid colour cells only.
+
+    The runtime gate has semantics 0=copy/no demo update and 1=changed/use demo update.
+    Regressing the actual tanh value avoids BCE's incorrect negative gate target for copy cells.
+    """
+    g = gate_values.float()
+    if positive_selector:
+        stats = _where_metrics_per_task(g, target, inputs, row_valid)
+        changed_rows = stats["has_changed"]
+        copy_rows = stats["copied_mask"].any(dim=1)
+        changed_bce = (stats["positive_bce_per_task"][changed_rows].mean()
+                       if bool(changed_rows.any()) else torch.zeros((), device=g.device))
+        copy_bce = (stats["negative_bce_per_task"][copy_rows].mean()
+                    if bool(copy_rows.any()) else torch.zeros((), device=g.device))
+        changed = stats["changed_mask"]
+        copied = stats["copied_mask"]
+
+        def mm(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            mf = mask.float()
+            return (value * mf).sum() / mf.sum().clamp_min(1.0)
+
+        return (
+            stats["proper_loss"], changed_bce, copy_bce,
+            stats["macro_f1"], stats["macro_fpr"], mm(g, changed), mm(g, copied), stats,
+        )
+    t = target.long()
+    valid = t >= 2
+    if row_valid is not None:
+        valid = valid & row_valid.to(device=t.device, dtype=torch.bool).view(-1, 1)
+    changed = valid & (inputs.long() != t)
+    copied = valid & (inputs.long() == t)
+
+    def mm(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_f = mask.float()
+        return (value * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+    changed_mse = mm((1.0 - g).square(), changed)
+    copy_mse = mm(g.square(), copied)
+    loss = changed_mse + copy_mse
+    with torch.no_grad():
+        pred_changed = (g > 0.5) & valid
+        tp = (pred_changed & changed).float().sum()
+        precision = tp / pred_changed.float().sum().clamp_min(1.0)
+        recall = tp / changed.float().sum().clamp_min(1.0)
+        f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
+        fpr = (pred_changed & copied).float().sum() / copied.float().sum().clamp_min(1.0)
+        changed_mean = mm(g, changed)
+        copy_mean = mm(g, copied)
+    return loss, changed_mse, copy_mse, f1, fpr, changed_mean, copy_mean, None
+
+
+def _where_support_contrast_per_task(
+    correct_stats: Dict[str, torch.Tensor],
+    shuffled_stats: Dict[str, torch.Tensor],
+    matched_rows: torch.Tensor,
+    margin: float = 0.05,
+) -> torch.Tensor:
+    """Matched-count support contrast with a finite empty-set contract."""
+    rows = (
+        matched_rows.to(device=correct_stats["proper_loss_per_task"].device, dtype=torch.bool)
+        & correct_stats["has_changed"]
+        & shuffled_stats["has_changed"]
+    )
+    if not bool(rows.any()):
+        return torch.zeros((), device=rows.device)
+    hinge = F.relu(
+        float(margin)
+        + correct_stats["proper_loss_per_task"]
+        - shuffled_stats["proper_loss_per_task"]
+    )
+    return hinge[rows].mean()
+
+
+def _where_counterfactual_metrics(
+    correct_gate: torch.Tensor,
+    shuffled_gate: torch.Tensor,
+    zero_gate: torch.Tensor,
+    target: torch.Tensor,
+    inputs: torch.Tensor,
+    rows: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """P3A Block 3: the WHERE counterfactual ladder (correct / matched-count shuffled / zero
+    support) scored on ONE shared row set. `rows` must already be the intersection of the three
+    arms' validity -- every arm sees exactly the same held-out rows, so the F1 differences are
+    attributable to the support signal and nothing else.
+
+    Scalars follow the panel convention (0 when undefined, with `where_shared_changed_rows`
+    exposing the denominator); per-example vectors carry NaN on rows where the metric is
+    undefined (no changed cells for F1, no copy cells for FPR) or outside the shared set."""
+    rows = rows.to(dtype=torch.bool)
+    c = _where_metrics_per_task(correct_gate.float(), target, inputs, rows)
+    s = _where_metrics_per_task(shuffled_gate.float(), target, inputs, rows)
+    z = _where_metrics_per_task(zero_gate.float(), target, inputs, rows)
+    nan_b = torch.full_like(c["f1_per_task"], float("nan"))
+
+    def _masked(stats: Dict[str, torch.Tensor], key: str, defined: torch.Tensor) -> torch.Tensor:
+        return torch.where(rows.to(defined.device) & defined, stats[key], nan_b)
+
+    return {
+        "where_correct_macro_f1": c["macro_f1"],
+        "where_shuffle_macro_f1": s["macro_f1"],
+        "where_zero_macro_f1": z["macro_f1"],
+        "where_correct_macro_fpr": c["macro_fpr"],
+        "where_correct_minus_shuffle_f1": c["macro_f1"] - s["macro_f1"],
+        "where_correct_minus_zero_f1": c["macro_f1"] - z["macro_f1"],
+        "where_shared_changed_rows": (rows & c["has_changed"]).float().sum(),
+        "where_correct_f1_per_ex": _masked(c, "f1_per_task", c["has_changed"]),
+        "where_shuffle_f1_per_ex": _masked(s, "f1_per_task", s["has_changed"]),
+        "where_zero_f1_per_ex": _masked(z, "f1_per_task", z["has_changed"]),
+        "where_correct_fpr_per_ex": _masked(c, "fpr_per_task", c["has_copy"]),
+    }
+
+
+def _require_auxiliary_outputs(
+    outputs: Dict[str, torch.Tensor],
+    required: Sequence[str],
+    purpose: str,
+) -> None:
+    """Reject an enabled auxiliary objective whose model-side evidence was not built."""
+    missing = sorted(key for key in required if key not in outputs)
+    if missing:
+        raise RuntimeError(
+            f"{purpose} is enabled but required model outputs are missing: "
+            f"{', '.join(missing)}. Check the corresponding model flags and shuffled/LODO path.")
 
 
 # (The _repair_gate_bce / _repair_color_ce / _rule_nce_cons helpers were REMOVED 2026-07-02: their
@@ -260,6 +830,18 @@ def _health_metrics(labels, main_preds, main_inputs,
         out["lodo_color_exact_per_ex"] = (acorr | ~acolor).all(-1).float()
         out["lodo_strict_exact_per_ex"] = arow_strict.float()
         out["lodo_color_cellsim_per_ex"] = (acorr & acolor).float().sum(-1) / acolor.float().sum(-1).clamp_min(1)
+        # CANDIDATE per-example views for paired analysis + mechanism-conditioned exact (Block 1/2).
+        # candidate = the trained V3 head reconstruction of the held-out demo (aux pass). [B] tensors.
+        # Empty subset (no changed / no copy cells on the row) = UNDEFINED = NaN, never a vacuous 0.
+        _achg_n = achanged.float().sum(-1)
+        _acpy_n = aunchanged.float().sum(-1)
+        _cnan = torch.full_like(_achg_n, float("nan"))
+        out["candidate_changed_acc_per_ex"] = torch.where(
+            _achg_n > 0, (acorr & achanged).float().sum(-1) / _achg_n.clamp_min(1.0), _cnan)
+        out["candidate_copy_acc_per_ex"] = torch.where(
+            _acpy_n > 0, (acorr & aunchanged).float().sum(-1) / _acpy_n.clamp_min(1.0), _cnan)
+        out["candidate_structure_exact_per_ex"] = astruct_ok.float()
+        out["candidate_strict_exact_per_ex"] = arow_strict.float()
         out["lodo_close_pct"] = ((acorr & ak).sum(-1).float() / ak.sum(-1).clamp_min(1)).mean() * 100.0
         if aux_floor_logits is not None:
             fp = aux_floor_logits.argmax(-1)
@@ -285,6 +867,9 @@ def _health_metrics(labels, main_preds, main_inputs,
             out["lodo_select_strict_exact_pct"] = sel_strict.mean() * 100.0
             out["lodo_select_ge_floor_pct"] = (sel_color_exact >= fcolor_exact - 1e-9).float().mean() * 100.0
             out["lodo_candidate_chosen_pct"] = choose_candidate.float().mean() * 100.0
+            floor_correct_copy = aunchanged & fcorr
+            out["lodo_floor_correct_copy_flip_pct"] = pct(
+                (ap != fp) & floor_correct_copy, floor_correct_copy)
             # PER-EXAMPLE floor views: with these, eval_selector reads floor AND candidate from ONE
             # forward (the dead _force_delta_off two-pass compare returned identical logits twice).
             out["lodo_floor_color_exact_per_ex"] = fcolor_exact
@@ -470,6 +1055,14 @@ class FVRACTLossHead(nn.Module):
         c2_value_v2_aux_weight: float = 0.0,
         c2_value_v2_aux_changed_weight: float = 1.0,
         c2_value_v2_aux_copy_weight: float = 1.0,
+        # Direct supervision for the explicit context-conditioned VALUE bind columns.
+        c2_value_ctx_bind_aux_weight: float = 0.0,
+        c2_value_ctx_bind_aux_changed_weight: float = 3.0,
+        c2_value_ctx_bind_aux_copy_weight: float = 2.0,
+        c2_bind_residual_aware: bool = False,
+        # Support-conditioned per-token C2 gate as a learned WHERE router.
+        c2_gate_where_weight: float = 0.0,
+        c2_gate_support_contrast_weight: float = 0.0,
         # --- Stage 0: no-grad diagnostic panel (free when off; needs the expose flag on) ---
         # (Stage-1 NCE/cons and the repair gate/colour kwargs were REMOVED 2026-07-02:
         # their model-side producers died in the delta-branch deletion.)
@@ -504,6 +1097,12 @@ class FVRACTLossHead(nn.Module):
         self.c2_value_v2_aux_weight = float(c2_value_v2_aux_weight)
         self.c2_value_v2_aux_changed_weight = float(c2_value_v2_aux_changed_weight)
         self.c2_value_v2_aux_copy_weight = float(c2_value_v2_aux_copy_weight)
+        self.c2_value_ctx_bind_aux_weight = float(c2_value_ctx_bind_aux_weight)
+        self.c2_value_ctx_bind_aux_changed_weight = float(c2_value_ctx_bind_aux_changed_weight)
+        self.c2_value_ctx_bind_aux_copy_weight = float(c2_value_ctx_bind_aux_copy_weight)
+        self.c2_bind_residual_aware = bool(c2_bind_residual_aware)
+        self.c2_gate_where_weight = float(c2_gate_where_weight)
+        self.c2_gate_support_contrast_weight = float(c2_gate_support_contrast_weight)
         self.c2_delta_diag = bool(c2_delta_diag)
 
     def initial_carry(self, *args, **kwargs):
@@ -1134,9 +1733,12 @@ class FVRACTLossHead(nn.Module):
                 metrics["c2_delta_lodo_outside"] = delta_out.detach()
 
         c2_value_v2_aux_loss = torch.zeros((), device=logits.device)
-        if self.c2_value_v2_aux_weight > 0 and {
-            "c2_aux_value_v2_logits", "c2_aux_labels", "c2_aux_inputs"
-        }.issubset(outputs.keys()):
+        if self.c2_value_v2_aux_weight > 0:
+            _require_auxiliary_outputs(
+                outputs,
+                ("c2_aux_value_v2_logits", "c2_aux_labels", "c2_aux_inputs"),
+                "VALUE-V2 auxiliary loss",
+            )
             v2_total, v2_changed, v2_copy, v2_changed_acc, v2_copy_acc = _value_v2_aux_ce(
                 outputs["c2_aux_value_v2_logits"],
                 outputs["c2_aux_labels"],
@@ -1154,6 +1756,251 @@ class FVRACTLossHead(nn.Module):
                 metrics["c2_value_v2_aux_copy_acc"] = v2_copy_acc.detach() * metric_count
                 metrics["c2_value_v2_aux_logit_std"] = v2_logits.std()
                 metrics["c2_value_v2_aux_logit_abs_mean"] = v2_logits.abs().mean()
+
+        c2_value_ctx_bind_aux_loss = torch.zeros((), device=logits.device)
+        _bind_logits = outputs.get("c2_aux_canonical_bind_logits", outputs.get("c2_aux_value_ctx_bind_logits"))
+        _bind_support = outputs.get(
+            "c2_aux_canonical_bind_support", outputs.get("c2_aux_value_ctx_bind_support"))
+        if self.c2_value_ctx_bind_aux_weight > 0:
+            _require_auxiliary_outputs(
+                outputs,
+                ("c2_aux_labels", "c2_aux_inputs"),
+                "canonical VALUE bind auxiliary loss",
+            )
+            if _bind_logits is None or _bind_support is None:
+                raise RuntimeError(
+                    "canonical VALUE bind auxiliary loss is enabled but neither the canonical "
+                    "nor legacy bind logits/support pair was produced. Enable the corresponding "
+                    "VALUE binder and LODO auxiliary path.")
+        if self.c2_bind_residual_aware:
+            _residual_keys = (
+                "c2_aux_canonical_bind_logits",
+                "c2_aux_canonical_bind_base_logits",
+                "c2_aux_canonical_bind_changed_support",
+                "c2_aux_canonical_bind_copy_support",
+                "c2_aux_labels",
+                "c2_aux_inputs",
+            )
+            if self.c2_value_ctx_bind_aux_weight > 0:
+                _require_auxiliary_outputs(outputs, _residual_keys, "residual-aware canonical VALUE bind loss")
+            # Diagnostics remain live at weight 0 for a matched measurement control.
+            if set(_residual_keys).issubset(outputs.keys()):
+                with torch.set_grad_enabled(
+                    torch.is_grad_enabled() and self.c2_value_ctx_bind_aux_weight > 0
+                ):
+                    bind_result = _canonical_bind_residual_ce(
+                        outputs["c2_aux_canonical_bind_base_logits"],
+                        outputs["c2_aux_canonical_bind_logits"],
+                        outputs["c2_aux_labels"],
+                        outputs["c2_aux_inputs"],
+                        outputs["c2_aux_canonical_bind_changed_support"],
+                        outputs["c2_aux_canonical_bind_copy_support"],
+                        self.c2_value_ctx_bind_aux_changed_weight,
+                    )
+                bind_total = bind_result["loss"]
+                if self.c2_value_ctx_bind_aux_weight > 0:
+                    c2_value_ctx_bind_aux_loss = self.c2_value_ctx_bind_aux_weight * bind_total
+                with torch.no_grad():
+                    metrics["c2_bind_aux_raw"] = bind_total.detach() * metric_count
+                    metrics["c2_bind_aux_changed_ce"] = bind_result["changed_ce"].detach() * metric_count
+                    metrics["c2_bind_aux_copy_ce"] = bind_result["copy_ce"].detach() * metric_count
+                    metrics["c2_bind_aux_changed_acc"] = bind_result["changed_acc"].detach() * metric_count
+                    metrics["c2_bind_aux_copy_acc"] = bind_result["copy_acc"].detach() * metric_count
+                    metrics["c2_bind_aux_support_coverage"] = (
+                        bind_result["support_coverage"].detach() * metric_count)
+                    metrics["c2_bind_aux_changed_support_coverage"] = (
+                        bind_result["changed_support_coverage"].detach() * metric_count)
+                    metrics["c2_bind_aux_copy_support_coverage"] = (
+                        bind_result["copy_support_coverage"].detach() * metric_count)
+                    metrics["c2_bind_aux_base_wrong_margin"] = (
+                        bind_result["base_wrong_margin"].detach() * metric_count)
+                    metrics["c2_bind_aux_residual_norm"] = (
+                        bind_result["residual_norm"].detach() * metric_count)
+                    metrics["c2_bind_aux_corrected_changed_frac"] = (
+                        bind_result["corrected_changed_frac"].detach() * metric_count)
+                    metrics["c2_bind_aux_caused_copy_flip_frac"] = (
+                        bind_result["caused_copy_flip_frac"].detach() * metric_count)
+                    for _bk, _bv in bind_result["per_ex"].items():
+                        metrics[_bk] = _bv.detach()
+        # Legacy standalone bind objective remains byte-for-byte available when Repair B is off.
+        elif (_bind_logits is not None and _bind_support is not None
+              and "c2_aux_labels" in outputs and "c2_aux_inputs" in outputs):
+            with torch.set_grad_enabled(torch.is_grad_enabled()
+                                        and self.c2_value_ctx_bind_aux_weight > 0):
+                bind_total, bind_changed, bind_copy, bind_changed_acc, bind_copy_acc, bind_coverage, bind_per_ex = (
+                    _value_ctx_bind_aux_ce(
+                        _bind_logits,
+                        outputs["c2_aux_labels"],
+                        outputs["c2_aux_inputs"],
+                        _bind_support,
+                        self.c2_value_ctx_bind_aux_changed_weight,
+                        self.c2_value_ctx_bind_aux_copy_weight,
+                    )
+                )
+            if self.c2_value_ctx_bind_aux_weight > 0:
+                c2_value_ctx_bind_aux_loss = self.c2_value_ctx_bind_aux_weight * bind_total
+            with torch.no_grad():
+                metrics["c2_bind_aux_raw"] = bind_total.detach() * metric_count
+                metrics["c2_bind_aux_changed_ce"] = bind_changed.detach() * metric_count
+                metrics["c2_bind_aux_copy_ce"] = bind_copy.detach() * metric_count
+                metrics["c2_bind_aux_changed_acc"] = bind_changed_acc.detach() * metric_count
+                metrics["c2_bind_aux_copy_acc"] = bind_copy_acc.detach() * metric_count
+                metrics["c2_bind_aux_support_coverage"] = bind_coverage.detach() * metric_count
+                for _bk, _bv in bind_per_ex.items():
+                    metrics[_bk] = _bv.detach()
+
+        # P1 VALUE-extraction diagnostics: training-free, no-grad, presence-gated on the canonical
+        # per-cell exports (distribution/marginal/base/route/reliability). Runs regardless of any
+        # loss weight -- it measures the TABLE, not the training.
+        _p1_needed = (
+            "c2_aux_canonical_bind_distribution", "c2_aux_canonical_bind_marginal",
+            "c2_aux_canonical_bind_base_logits", "c2_aux_canonical_bind_changed_support",
+            "c2_aux_canonical_bind_copy_support", "c2_aux_canonical_bind_reliability",
+            "c2_aux_canonical_bind_route", "c2_aux_labels", "c2_aux_inputs",
+        )
+        if all(k in outputs and outputs[k] is not None for k in _p1_needed):
+            metrics.update(_p1_value_extraction_metrics(
+                outputs["c2_aux_canonical_bind_base_logits"],
+                outputs["c2_aux_canonical_bind_distribution"],
+                outputs["c2_aux_canonical_bind_marginal"],
+                outputs["c2_aux_labels"],
+                outputs["c2_aux_inputs"],
+                outputs["c2_aux_canonical_bind_changed_support"],
+                outputs["c2_aux_canonical_bind_copy_support"],
+                outputs["c2_aux_canonical_bind_reliability"],
+                outputs["c2_aux_canonical_bind_route"],
+            ))
+
+        c2_gate_where_loss = torch.zeros((), device=logits.device)
+        c2_gate_support_contrast_loss = torch.zeros((), device=logits.device)
+        _gate_w_on = self.c2_gate_where_weight > 0 or self.c2_gate_support_contrast_weight > 0
+        if _gate_w_on:
+            _require_auxiliary_outputs(
+                outputs,
+                ("c2_aux_gate_where_values", "c2_aux_labels", "c2_aux_inputs"),
+                "C2 WHERE auxiliary loss",
+            )
+            if self.c2_gate_support_contrast_weight > 0:
+                _require_auxiliary_outputs(
+                    outputs,
+                    ("c2_shuffle_gate_where_values", "c2_lodo_shuffle_valid"),
+                    "C2 gate support contrast",
+                )
+        # WHERE diagnostics run whenever the gate produced values -- an M0 measurement control
+        # (mechanism built, aux weights 0) must still report WHERE metrics. Only the LOSS terms
+        # below stay weight-gated; at weight 0 the objective runs grad-free.
+        # P3A Block 4: when the runner's gradient probe armed a stash, the WHERE objective and the
+        # RAW support contrast must stay ATTACHED even at loss weight 0 -- the probe measures their
+        # gradient norms without ever adding them to the training loss.
+        _probe_stash = getattr(self, "_where_grad_probe_stash", None)
+        if {"c2_aux_gate_where_values", "c2_aux_labels", "c2_aux_inputs"}.issubset(outputs.keys()):
+            _positive_gate = bool(float(outputs.get(
+                "c2_aux_positive_where_gate", torch.zeros((), device=logits.device)).item()) > 0.5)
+            with torch.set_grad_enabled(
+                    torch.is_grad_enabled() and (_gate_w_on or _probe_stash is not None)):
+                gate_terms = _gate_where_objective(
+                    outputs["c2_aux_gate_where_values"],
+                    outputs["c2_aux_labels"],
+                    outputs["c2_aux_inputs"],
+                    outputs.get("c2_aux_valid"),
+                    positive_selector=_positive_gate,
+                )
+            gate_raw, gate_changed, gate_copy, gate_f1, gate_fpr, gate_changed_mean, gate_copy_mean, gate_stats = gate_terms
+            if _probe_stash is not None:
+                _probe_stash["l_where_raw"] = gate_raw
+            if not bool(torch.isfinite(gate_raw)):
+                _q = outputs["c2_aux_gate_where_values"].detach().float()
+                raise FloatingPointError(
+                    "non-finite WHERE objective despite finite selector values: "
+                    f"q=[{float(_q.min()):.6g},{float(_q.max()):.6g}] "
+                    f"changed_term={float(gate_changed.detach()):.6g} "
+                    f"copy_term={float(gate_copy.detach()):.6g}")
+            if self.c2_gate_where_weight > 0:
+                c2_gate_where_loss = self.c2_gate_where_weight * gate_raw
+            with torch.no_grad():
+                metrics["c2_gate_where_raw"] = gate_raw.detach() * metric_count
+                metrics["c2_gate_where_changed_mse"] = gate_changed.detach() * metric_count
+                metrics["c2_gate_where_copy_mse"] = gate_copy.detach() * metric_count
+                metrics["c2_gate_where_f1"] = gate_f1.detach() * metric_count
+                metrics["c2_gate_where_fpr"] = gate_fpr.detach() * metric_count
+                metrics["c2_gate_where_changed_mean"] = gate_changed_mean.detach() * metric_count
+                metrics["c2_gate_where_copy_mean"] = gate_copy_mean.detach() * metric_count
+                if gate_stats is not None:
+                    metrics["c2_where_target_macro_f1"] = gate_stats["macro_f1"].detach() * metric_count
+                    metrics["c2_where_target_micro_f1"] = gate_stats["micro_f1"].detach() * metric_count
+                    metrics["c2_where_target_macro_fpr"] = gate_stats["macro_fpr"].detach() * metric_count
+                    # PER-EXAMPLE WHERE views for paired analysis (Block 1). [B] tensors, no metric_count.
+                    # Positive-class F1 is UNDEFINED on copy-only rows and FPR on all-changed rows:
+                    # emit NaN there so paired means/CIs never average vacuous zeros.
+                    _wnan = torch.full_like(gate_stats["f1_per_task"], float("nan"))
+                    metrics["c2_where_f1_per_ex"] = torch.where(
+                        gate_stats["has_changed"], gate_stats["f1_per_task"], _wnan).detach()
+                    metrics["c2_where_fpr_per_ex"] = torch.where(
+                        gate_stats["has_copy"], gate_stats["fpr_per_task"], _wnan).detach()
+                    metrics["c2_where_has_changed_per_ex"] = gate_stats["has_changed"].detach().float()
+                    # where_mask_exact stays finite on copy-only rows ON PURPOSE: a gate that stays
+                    # quiet on a row where nothing changes is a CORRECT prediction, not a vacuous one.
+                    metrics["c2_where_mask_exact_per_ex"] = gate_stats["where_mask_exact"].detach().float()   # Block 2
+
+            if {
+                "c2_shuffle_gate_where_values", "c2_lodo_shuffle_valid",
+            }.issubset(outputs.keys()):
+                shared_rows = outputs.get("c2_aux_valid", torch.ones_like(outputs["c2_lodo_shuffle_valid"]))
+                shared_rows = shared_rows.to(torch.bool) & outputs["c2_lodo_shuffle_valid"].to(torch.bool)
+                with torch.set_grad_enabled(
+                        torch.is_grad_enabled()
+                        and (self.c2_gate_support_contrast_weight > 0 or _probe_stash is not None)):
+                    correct_shared = _gate_where_objective(
+                        outputs["c2_aux_gate_where_values"], outputs["c2_aux_labels"],
+                        outputs["c2_aux_inputs"], shared_rows, positive_selector=_positive_gate)
+                    shuffled_shared = _gate_where_objective(
+                        outputs["c2_shuffle_gate_where_values"], outputs["c2_aux_labels"],
+                        outputs["c2_aux_inputs"], shared_rows, positive_selector=_positive_gate)
+                    if _positive_gate and correct_shared[7] is not None and shuffled_shared[7] is not None:
+                        support_raw = _where_support_contrast_per_task(
+                            correct_shared[7], shuffled_shared[7], shared_rows, margin=0.05)
+                    else:
+                        support_raw = F.relu(0.05 + correct_shared[0] - shuffled_shared[0])
+                if _probe_stash is not None:
+                    _probe_stash["l_support_raw"] = support_raw
+                if self.c2_gate_support_contrast_weight > 0:
+                    c2_gate_support_contrast_loss = self.c2_gate_support_contrast_weight * support_raw
+                with torch.no_grad():
+                    metrics["c2_gate_shuffle_f1"] = shuffled_shared[3].detach() * metric_count
+                    metrics["c2_gate_shuffle_fpr"] = shuffled_shared[4].detach() * metric_count
+                    metrics["c2_gate_support_f1_gap"] = (
+                        correct_shared[3] - shuffled_shared[3]).detach() * metric_count
+                    metrics["c2_gate_support_contrast_raw"] = support_raw.detach() * metric_count
+                    metrics["c2_where_shuffle_macro_f1"] = shuffled_shared[3].detach() * metric_count
+                    metrics["c2_where_support_gap"] = (
+                        correct_shared[3] - shuffled_shared[3]).detach() * metric_count
+
+            # P3A Block 3: three-arm WHERE counterfactual (correct / shuffled / zero) on IDENTICAL
+            # held-out rows. Diagnostic-only: no loss term reads the zero arm, so this stays
+            # no-grad regardless of weights. Positive selector only (F1 thresholds assume q in
+            # [0,1]; the tanh gate would raise inside the per-task contract).
+            if _positive_gate and {
+                "c2_zero_gate_where_values", "c2_zero_support_valid",
+                "c2_shuffle_gate_where_values", "c2_lodo_shuffle_valid",
+            }.issubset(outputs.keys()):
+                with torch.no_grad():
+                    _rows3 = (
+                        outputs.get(
+                            "c2_aux_valid",
+                            torch.ones_like(outputs["c2_lodo_shuffle_valid"])).to(torch.bool)
+                        & outputs["c2_lodo_shuffle_valid"].to(torch.bool)
+                        & outputs["c2_zero_support_valid"].to(torch.bool)
+                    )
+                    _cf = _where_counterfactual_metrics(
+                        outputs["c2_aux_gate_where_values"],
+                        outputs["c2_shuffle_gate_where_values"],
+                        outputs["c2_zero_gate_where_values"],
+                        outputs["c2_aux_labels"],
+                        outputs["c2_aux_inputs"],
+                        _rows3,
+                    )
+                    for _k, _v in _cf.items():
+                        metrics[_k] = _v if _k.endswith("_per_ex") else _v.detach() * metric_count
 
         # --- Phase-B two-region CONTRAST: real demos must reconstruct the CHANGED cells better
         # than a DIFFERENT task's demos (hinge). This is the discriminative pressure that forces
@@ -1250,15 +2097,48 @@ class FVRACTLossHead(nn.Module):
             + c2_gate_reg
             + c2_delta_lodo_loss
             + c2_value_v2_aux_loss
+            + c2_value_ctx_bind_aux_loss
+            + c2_gate_where_loss
+            + c2_gate_support_contrast_loss
             + c2_delta_contrast_loss
             + c2_delta_preserve_loss
         )
+        total_lm_components = {
+            "lm_loss": lm_loss,
+            "lm_loss_aux": lm_loss_aux,
+            "c2_aux_loss": c2_aux_loss,
+            "c2_geometry_loss": c2_geometry_loss,
+            "c2_shape_loss": c2_shape_loss,
+            "c2_color_force_loss": c2_color_force_loss,
+            "c2_pad_loss": c2_pad_loss,
+            "c2_changed_valid_loss": c2_changed_valid_loss,
+            "c2_gate_reg": c2_gate_reg,
+            "c2_delta_lodo_loss": c2_delta_lodo_loss,
+            "c2_value_v2_aux_loss": c2_value_v2_aux_loss,
+            "c2_value_ctx_bind_aux_loss": c2_value_ctx_bind_aux_loss,
+            "c2_gate_where_loss": c2_gate_where_loss,
+            "c2_gate_support_contrast_loss": c2_gate_support_contrast_loss,
+            "c2_delta_contrast_loss": c2_delta_contrast_loss,
+            "c2_delta_preserve_loss": c2_delta_preserve_loss,
+        }
+        if not bool(torch.isfinite(total_lm)):
+            raise FloatingPointError(_numerical_failure_message(
+                "non-finite total_lm",
+                total_lm_components,
+                outputs,
+                self.model,
+            ))
         metrics["lm_loss"] = total_lm.detach()
         metrics["lm_loss_main"] = lm_loss.detach()
         metrics["lm_loss_aux"] = lm_loss_aux.detach()
         metrics["c2_aux_weighted_loss"] = c2_aux_loss.detach()
         metrics["c2_delta_lodo_weighted_loss"] = c2_delta_lodo_loss.detach()
         metrics["c2_value_v2_aux_weighted_loss"] = c2_value_v2_aux_loss.detach()
+        metrics["c2_bind_aux_weighted_loss"] = c2_value_ctx_bind_aux_loss.detach() * metric_count
+        metrics["c2_gate_where_weighted_loss"] = c2_gate_where_loss.detach() * metric_count
+        metrics["c2_gate_support_contrast_weighted_loss"] = (
+            c2_gate_support_contrast_loss.detach() * metric_count
+        )
         metrics["c2_delta_contrast_weighted_loss"] = c2_delta_contrast_loss.detach()
         metrics["c2_delta_preserve_weighted_loss"] = c2_delta_preserve_loss.detach()
         metrics["c2_changed_valid_weighted_loss"] = c2_changed_valid_loss.detach()
@@ -1268,4 +2148,18 @@ class FVRACTLossHead(nn.Module):
         metrics["q_halt_loss"] = q_halt_loss.detach()
 
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
-        return new_carry, total_lm + spec + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        final_loss = total_lm + spec + 0.5 * (q_halt_loss + q_continue_loss)
+        if not bool(torch.isfinite(final_loss)):
+            final_components = {
+                "total_lm": total_lm,
+                "spec": spec,
+                "half_q_halt": 0.5 * q_halt_loss,
+                "half_q_continue": 0.5 * q_continue_loss,
+            }
+            raise FloatingPointError(_numerical_failure_message(
+                "non-finite final loss",
+                final_components,
+                outputs,
+                self.model,
+            ))
+        return new_carry, final_loss, metrics, detached_outputs, new_carry.halted.all()

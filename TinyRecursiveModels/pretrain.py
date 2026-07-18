@@ -299,6 +299,53 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
 
+def _prepare_evidence_schema_state(
+    state_dict: dict[str, torch.Tensor],
+    model_state: dict[str, torch.Tensor],
+    schema_name: str,
+    *,
+    allow_legacy: bool,
+) -> list[str]:
+    """Validate evidence semantics and make a legacy warm-start unambiguous.
+
+    Equal widths do not imply equal evidence meanings. Fingerprinted checkpoints must match
+    exactly. Explicitly accepted pre-fingerprint checkpoints retain unrelated TRM weights but
+    discard every learned tensor whose columns encode the new evidence schema.
+    """
+    if schema_name not in model_state:
+        return []
+    if schema_name in state_dict:
+        if not torch.equal(
+            state_dict[schema_name].detach().cpu(), model_state[schema_name].detach().cpu()
+        ):
+            raise RuntimeError(
+                "Checkpoint evidence schema is semantically incompatible with the active "
+                "ordered evidence layout. Tensor widths alone are not a valid migration.")
+        return []
+    if not allow_legacy:
+        raise RuntimeError(
+            "Checkpoint predates evidence-schema fingerprints. Set "
+            "arch.c2_allow_legacy_evidence_schema=true only for an audited legacy warm-start.")
+
+    inner_prefix = schema_name[:-len("evidence_schema_fingerprint")]
+    semantic_prefixes = (
+        f"{inner_prefix}color_evidence_proj.",
+        f"{inner_prefix}color_head_mlp_in.",
+        f"{inner_prefix}color_head_mlp_out.",
+        f"{inner_prefix}rule_factor_proj.",
+        f"{inner_prefix}pairdelta_input_encoder.spatial_mlp.",
+    )
+    dropped = sorted(
+        key for key in state_dict
+        if any(key.startswith(prefix) for prefix in semantic_prefixes)
+    )
+    for key in dropped:
+        del state_dict[key]
+    # Install the active schema buffer so assign=True cannot retain an absent/ambiguous contract.
+    state_dict[schema_name] = model_state[schema_name].detach().clone()
+    return dropped
+
+
 def load_checkpoint(model: nn.Module, config: PretrainConfig):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
@@ -319,6 +366,19 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
         def _state_key(name: str) -> str:
             return f"_orig_mod.{name}" if model_uses_compile_prefix else name
+
+        schema_name = _state_key("model.inner.evidence_schema_fingerprint")
+        legacy_schema = schema_name in model_state and schema_name not in state_dict
+        legacy_dropped = _prepare_evidence_schema_state(
+            state_dict,
+            model_state,
+            schema_name,
+            allow_legacy=bool(getattr(config.arch, "c2_allow_legacy_evidence_schema", False)),
+        )
+        if legacy_schema:
+            print(
+                "[checkpoint] LEGACY evidence schema accepted; reset "
+                f"{len(legacy_dropped)} semantic-consumer tensor(s).")
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = _state_key("model.inner.puzzle_emb.weights")
@@ -389,6 +449,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
             model.load_state_dict(state_dict, assign=True)
         except RuntimeError as exc:
             expected_missing_fragments = (
+                "model.inner.evidence_schema_fingerprint",
                 "model.inner.relmap_proj.",
                 "model.inner.frame_embed.",
                 "model.inner.rule_hyp_embed.",
@@ -406,6 +467,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                 "model.inner.c2_demo_relmap_proj.",
                 "model.inner.pairdelta_input_encoder.",
                 "model.inner.delta_rule_input_proj.",
+                "model.inner.rule_factor_proj.",
                 "model.inner.color_residual_head.",
                 "model.inner.color_residual_gate",
                 "model.inner.grid_encoder.visual_encoder.",

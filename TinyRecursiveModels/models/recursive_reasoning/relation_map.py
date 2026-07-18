@@ -37,6 +37,7 @@ from collections import deque
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
 # ======================================================================================
 # section 1 -- CONSTANTS + CHANNEL SCHEMAS
@@ -136,6 +137,166 @@ def _index_ns(names: tuple) -> SimpleNamespace:
 RelCh = _index_ns(REL_MAP_RELATION_NAMES)      # relational_maps channels
 SigCol = _index_ns(CELL_SIG_NAMES)             # cell_conditioning_signature columns
 RelP = _index_ns(REL_WHERE_RELATION_NAMES)     # WHERE relation order inside the predicate bank
+
+
+def hierarchical_context_keys(
+    signature: torch.Tensor,
+    valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build five collision-free, increasingly specific task-local VALUE keys.
+
+    The old live path compressed a rich tuple with ``% 512``. This mixed unrelated contexts. These
+    mixed-radix keys are injective over the declared signature domains; invalid cells receive -1 at
+    every level. Callers can aggregate only keys observed in the current task with ``torch.unique``.
+    """
+    if signature.shape[-1] < CELL_SIG_DIM:
+        raise ValueError(
+            f"signature has {signature.shape[-1]} columns; expected at least {CELL_SIG_DIM}")
+    s = signature.long()
+    if valid is None:
+        valid = s[..., SigCol.SELF_COLOR] >= 0
+    valid = valid.to(device=s.device, dtype=torch.bool)
+
+    def bounded(column: int, high: int) -> torch.Tensor:
+        return s[..., column].clamp(0, high)
+
+    src = bounded(SigCol.SELF_COLOR, 9)
+    object_colour = bounded(SigCol.OBJ_COLOR, 10)
+    # Background is a role, not colour 0. Foreground cells are attributed to an object of their
+    # own colour; outside or enclosed background cells have a sentinel/enclosing object colour.
+    background_role = (object_colour != src).long()
+    enclosure = bounded(SigCol.ENCL_COLOR_FF, 10)
+    touch_colour = bounded(SigCol.TOUCH_COLOUR_MODE, 10)
+    touch_count = bounded(SigCol.TOUCH_COLOUR_COUNT, 4)
+    nearest_seed = bounded(SigCol.NEAREST_SEED_COLOR, 10)
+    rank = bounded(SigCol.OBJ_SIZE_RANK, 8)
+    holes = bounded(SigCol.OBJ_HOLES, 4)
+    local_row = bounded(SigCol.LOCAL_ROW3, 3)
+    local_col = bounded(SigCol.LOCAL_COL3, 3)
+
+    k0 = src
+    k1 = k0 * 2 + background_role
+    k2 = ((k1 * 11 + enclosure) * 11 + touch_colour) * 5 + touch_count
+    k3 = k2 * 11 + nearest_seed
+    k4 = (((k3 * 9 + rank) * 5 + holes) * 4 + local_row) * 4 + local_col
+    keys = torch.stack((k0, k1, k2, k3, k4), dim=-1)
+    return torch.where(valid.unsqueeze(-1), keys, torch.full_like(keys, -1))
+
+
+def hierarchical_value_binding(
+    support_signature: torch.Tensor,
+    support_dst_colour: torch.Tensor,
+    support_valid: torch.Tensor,
+    support_changed: torch.Tensor,
+    target_signature: torch.Tensor,
+    target_valid: torch.Tensor,
+    tau: float = 3.0,
+) -> dict[str, torch.Tensor]:
+    """Task-local collision-free VALUE binding with hierarchical Dirichlet backoff.
+
+    Outcomes are represented jointly as ten changed destination colours plus one COPY event. At each
+    key level, observed counts update the previous distribution; absent keys retain the previous
+    distribution exactly. This produces the canonical mixture in one pass rather than asking several
+    independent classifiers to rediscover copy-vs-change multiplication.
+
+    P1 (outcome-specific backoff): changed and copy SUPPORT are selected independently -- each uses
+    the deepest level whose own outcome count is positive, so a deeper copy-only context can no
+    longer erase changed support observed at an ancestor (and vice versa). The joint Dirichlet
+    posterior itself is unchanged. ``marginal_distribution`` is the posterior snapshotted after K0
+    (source colour only), before any K1..K4 context conditioning.
+    """
+    if tau <= 0:
+        raise ValueError(f"hierarchical_value_binding requires tau > 0, got {tau}")
+    if support_signature.ndim != 3 or target_signature.ndim != 2:
+        raise ValueError("support_signature must be [M,L,C] and target_signature [L,C]")
+    if support_signature.shape[-1] < CELL_SIG_DIM or target_signature.shape[-1] < CELL_SIG_DIM:
+        raise ValueError("conditioning signatures do not match the declared schema")
+    device = target_signature.device
+    s_valid = support_valid.to(device=device, dtype=torch.bool).reshape(-1)
+    s_changed = support_changed.to(device=device, dtype=torch.bool).reshape(-1)
+    s_dst = support_dst_colour.to(device=device, dtype=torch.long).reshape(-1).clamp(0, 9)
+    t_valid = target_valid.to(device=device, dtype=torch.bool).reshape(-1)
+    s_keys = hierarchical_context_keys(
+        support_signature.to(device).reshape(-1, CELL_SIG_DIM), s_valid)
+    t_keys = hierarchical_context_keys(target_signature.to(device), t_valid)
+
+    # outcome 0..9 = changed destination colour; outcome 10 = copy
+    outcome = torch.where(s_changed, s_dst, torch.full_like(s_dst, 10))
+    global_counts = torch.zeros(11, device=device, dtype=torch.float32)
+    if bool(s_valid.any()):
+        global_counts.scatter_add_(0, outcome[s_valid], torch.ones_like(outcome[s_valid], dtype=torch.float32))
+        global_prob = global_counts / global_counts.sum().clamp_min(1.0)
+    else:
+        global_prob = torch.zeros(11, device=device, dtype=torch.float32)
+        global_prob[10] = 1.0
+    prob = global_prob.view(1, 11).expand(target_signature.shape[0], -1).clone()
+    marginal_prob = prob.clone()   # overwritten by the post-K0 snapshot below when K0 hits
+    support_count = torch.zeros(target_signature.shape[0], device=device, dtype=torch.float32)
+    changed_support_count = torch.zeros_like(support_count)
+    copy_support_count = torch.zeros_like(support_count)
+    level_used = torch.full(
+        (target_signature.shape[0],), -1, device=device, dtype=torch.long)
+    changed_level_used = torch.full_like(level_used, -1)
+    copy_level_used = torch.full_like(level_used, -1)
+
+    for level in range(5):
+        sk = s_keys[:, level]
+        tk = t_keys[:, level]
+        observed = s_valid & (sk >= 0)
+        if not bool(observed.any()):
+            continue
+        unique, inverse = torch.unique(sk[observed], sorted=True, return_inverse=True)
+        counts = torch.zeros((unique.numel(), 11), device=device, dtype=torch.float32)
+        counts.index_put_(
+            (inverse, outcome[observed]),
+            torch.ones_like(outcome[observed], dtype=torch.float32),
+            accumulate=True,
+        )
+        idx = torch.searchsorted(unique, tk.clamp_min(0))
+        safe_idx = idx.clamp_max(max(unique.numel() - 1, 0))
+        hit = t_valid & (tk >= 0) & (idx < unique.numel()) & (unique[safe_idx] == tk)
+        gathered = counts[safe_idx]
+        n = gathered.sum(dim=-1, keepdim=True)
+        updated = (gathered + float(tau) * prob) / (n + float(tau))
+        prob = torch.where(hit.unsqueeze(-1), updated, prob)
+        if level == 0:
+            marginal_prob = prob.clone()   # "after K0, before K1..K4"
+        support_count = torch.where(hit, n.squeeze(-1), support_count)
+        level_used = torch.where(hit, torch.full_like(level_used, level), level_used)
+        # OUTCOME-SPECIFIC selection (P1): a level only claims changed/copy support when ITS OWN
+        # outcome count is positive -- deeper copy-only keys keep the ancestor's changed support.
+        lvl_changed_n = gathered[:, :10].sum(dim=-1)
+        lvl_copy_n = gathered[:, 10]
+        chg_hit = hit & (lvl_changed_n > 0)
+        cpy_hit = hit & (lvl_copy_n > 0)
+        changed_support_count = torch.where(chg_hit, lvl_changed_n, changed_support_count)
+        changed_level_used = torch.where(chg_hit, torch.full_like(changed_level_used, level), changed_level_used)
+        copy_support_count = torch.where(cpy_hit, lvl_copy_n, copy_support_count)
+        copy_level_used = torch.where(cpy_hit, torch.full_like(copy_level_used, level), copy_level_used)
+
+    target_src = target_signature[:, SigCol.SELF_COLOR].long().clamp(0, 9)
+    copy_hot = F.one_hot(target_src, num_classes=10).to(torch.float32)
+    bind = (prob[:, :10] + copy_hot * prob[:, 10:11]) * t_valid.unsqueeze(-1).float()
+    marginal = (marginal_prob[:, :10] + copy_hot * marginal_prob[:, 10:11]) * t_valid.unsqueeze(-1).float()
+    support_count = support_count * t_valid.float()
+    changed_support_count = changed_support_count * t_valid.float()
+    copy_support_count = copy_support_count * t_valid.float()
+    return {
+        "distribution": bind,
+        "marginal_distribution": marginal,
+        "copy_probability": prob[:, 10] * t_valid.float(),
+        "change_probability": prob[:, :10].sum(dim=-1) * t_valid.float(),
+        "support_count": support_count,
+        "support_reliability": support_count / (support_count + float(tau)),
+        "changed_support_count": changed_support_count,
+        "copy_support_count": copy_support_count,
+        "changed_supported": changed_support_count > 0,
+        "copy_supported": copy_support_count > 0,
+        "level_used": level_used,
+        "changed_level_used": changed_level_used,
+        "copy_level_used": copy_level_used,
+        "collision_count": torch.zeros((), device=device, dtype=torch.long),
+    }
 
 # --- WHERE predicate thresholds (section 4). Formerly magic numbers inside the mask builder. ------
 EDGE_NEAR = 0.16       # "near the bbox edge": <= ~1/6 of bbox extent (bbox-normalised clearance)

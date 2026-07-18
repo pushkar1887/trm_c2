@@ -62,6 +62,23 @@ DDF_SCALARS = 120                     # [120:126) changed_rate, area_ratio/5, in
                                       #   Kept verbatim; background-aware variants are a SS7 extension.
 FEATURE_DIM = N_TRANSITIONS + N_COLORS + N_COLORS + 6  # 126 (defined early; oracle defines it late)
 
+# Optional spatial-delta branch. These columns do NOT alter FEATURE_DIM or the legacy pair_mlp
+# checkpoint contract; PairDeltaEncoder fuses them through a separate zero-init residual only when
+# explicitly enabled.
+PDS_DY = 0
+PDS_DX = 1
+PDS_DIRECTION_CONSISTENCY = 2
+PDS_BBOX_DH = 3
+PDS_BBOX_DW = 4
+PDS_SAME_SHAPE_TRANSPORT = 5
+PDS_CREATION_CONFIDENCE = 6
+PDS_DELETION_CONFIDENCE = 7
+SPATIAL_DELTA_DIM = 8
+SPATIAL_DELTA_NAMES = (
+    "dominant_dy", "dominant_dx", "direction_consistency", "bbox_dh", "bbox_dw",
+    "same_shape_transport", "creation_confidence", "deletion_confidence",
+)
+
 # pairdelta_intent_features dict keys, split by CURRENT consumer status (Block 5 wires the dead ones):
 INTENT_KEYS_LIVE = ("feature",)                                   # the 1 evidence scalar
 INTENT_KEYS_METRICS = ("conditional_recolor_score", "global_recolor_score",
@@ -115,7 +132,8 @@ def _color_grid(tokens: torch.Tensor) -> torch.Tensor:
 
 
 def demo_delta_features(context_inputs: torch.Tensor, context_outputs: torch.Tensor,
-                        context_mask: torch.Tensor, fast: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                        context_mask: torch.Tensor, fast: bool = False,
+                        include_identity: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-demo explicit transformation features.
 
     Returns:
@@ -168,7 +186,7 @@ def demo_delta_features(context_inputs: torch.Tensor, context_outputs: torch.Ten
                            in_nonbg, out_nonbg, add_rate, del_rate], dim=-1)  # [B,M,6]
 
     feats = torch.cat([trans, in_hist, out_hist, scalars], dim=-1)           # [B,M,126]
-    valid = changed.any(dim=-1) & cm                                          # [B,M]
+    valid = ((real.any(dim=-1) if include_identity else changed.any(dim=-1)) & cm)  # [B,M]
     return feats, valid
 
 
@@ -244,6 +262,56 @@ def pairdelta_intent_features(
         }
 
 
+def spatial_delta_features(
+    context_inputs: torch.Tensor,
+    context_outputs: torch.Tensor,
+    context_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-demo object transport evidence for the existing PairDelta encoder.
+
+    Returns normalized ``[B,M,8]`` features and a ``[B,M]`` extraction-valid mask. Object
+    correspondence is colour-agnostic, so a slide-plus-recolour demo still yields movement. This
+    function supplies evidence only; it never renders or proposes an output grid.
+    """
+    if context_inputs.ndim != 3 or context_outputs.shape != context_inputs.shape:
+        raise ValueError("context_inputs/context_outputs must have shape [B,M,L]")
+    B, M, L = context_inputs.shape
+    side = int(round(L ** 0.5))
+    if side * side != L:
+        raise ValueError(f"PairDelta spatial features require a square token canvas, got L={L}")
+    device = context_inputs.device
+    out = torch.zeros((B, M, SPATIAL_DELTA_DIM), device=device, dtype=torch.float32)
+    extracted = torch.zeros((B, M), device=device, dtype=torch.bool)
+    cm = context_mask.to(device=device, dtype=torch.bool)
+    ci = context_inputs.detach().to(device="cpu", dtype=torch.long)
+    co = context_outputs.detach().to(device="cpu", dtype=torch.long)
+    scale = float(max(side - 1, 1))
+
+    # core_prior owns object matching. Keeping this import local avoids a module cycle and ensures
+    # PairDelta and the rule-factor diagnostics use one correspondence definition.
+    from models.recursive_reasoning.core_prior import evidence_rule_factors
+
+    with torch.no_grad():
+        for b in range(B):
+            for m in cm[b].nonzero(as_tuple=True)[0].tolist():
+                try:
+                    factors = evidence_rule_factors(ci[b, m:m + 1], co[b, m:m + 1], side)
+                except (AssertionError, RuntimeError, TypeError, ValueError):
+                    continue
+                out[b, m] = torch.tensor((
+                    float(factors["dominant_dy"]) / scale,
+                    float(factors["dominant_dx"]) / scale,
+                    float(factors["direction_consistency"]),
+                    float(factors["bbox_dh"]) / scale,
+                    float(factors["bbox_dw"]) / scale,
+                    float(factors["same_shape_transport"]),
+                    float(factors["creation_confidence"]),
+                    float(factors["deletion_confidence"]),
+                ), device=device, dtype=torch.float32)
+                extracted[b, m] = True
+    return out, extracted
+
+
 # =====================================================================================
 # SS4 VERBATIM LEARNED PORT -- parameter names IDENTICAL to the oracle's modules, so an
 #     oracle state_dict loads strict=True (checkpoint-compatible both ways). Forward math
@@ -256,15 +324,26 @@ def pairdelta_intent_features(
 # =====================================================================================
 class PairDeltaEncoder(nn.Module):
     def __init__(self, hidden_dim: int = 256, n_slots: int = 8, n_heads: int = 4,
-                 fast: bool = False):
+                 fast: bool = False, include_identity: bool = False,
+                 include_spatial: bool = False):
         super().__init__()
         self.D = hidden_dim
         self.K = n_slots
         self.fast = bool(fast)                     # SS2 fast path (allclose, default off)
+        self.include_identity = bool(include_identity)
+        self.include_spatial = bool(include_spatial)
         self.pair_mlp = nn.Sequential(
             nn.Linear(FEATURE_DIM, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
         )
+        if self.include_spatial:
+            self.spatial_mlp = nn.Sequential(
+                nn.Linear(SPATIAL_DELTA_DIM, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),
+            )
+            # Exact step-0 no-op: old checkpoints and the 126-column colour branch retain their
+            # behaviour while the dedicated spatial parameters can learn at the PairDelta LR.
+            nn.init.zeros_(self.spatial_mlp[-1].weight)
         self.slot_queries = nn.Parameter(torch.randn(n_slots, hidden_dim) * 0.02)
         self.slot_attn = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
         self.slot_norm = nn.LayerNorm(hidden_dim)
@@ -273,9 +352,18 @@ class PairDeltaEncoder(nn.Module):
 
     def forward(self, context_inputs, context_outputs, context_mask) -> Dict[str, torch.Tensor]:
         feats, valid = demo_delta_features(context_inputs, context_outputs, context_mask,
-                                           fast=self.fast)
+                                           fast=self.fast, include_identity=self.include_identity)
         B, M, _ = feats.shape
         d = self.pair_mlp(feats)                                  # [B,M,D]
+        spatial_norm = torch.zeros((), device=d.device, dtype=torch.float32)
+        spatial_valid = torch.zeros_like(valid)
+        if self.include_spatial:
+            spatial, spatial_valid = spatial_delta_features(
+                context_inputs, context_outputs, context_mask)
+            d = d + self.spatial_mlp(spatial.to(d.dtype)) * spatial_valid.unsqueeze(-1).to(d.dtype)
+            denom = spatial_valid.float().sum().clamp_min(1.0)
+            spatial_norm = (
+                spatial.float().norm(dim=-1) * spatial_valid.float()).sum() / denom
         # masked slot attention: slots (query) attend over per-demo features (key/value)
         q = self.slot_queries.unsqueeze(0).expand(B, -1, -1)      # [B,K,D]
         kpm = ~valid                                             # True = mask out
@@ -295,7 +383,9 @@ class PairDeltaEncoder(nn.Module):
         rule_vec = torch.where(empty.unsqueeze(-1), torch.zeros_like(rule_vec), rule_vec)
         conf = torch.where(empty, torch.zeros_like(conf), conf)
         return {"rule_slots": slots, "rule_vec": rule_vec,
-                "rule_confidence": conf, "demo_valid": valid}
+                "rule_confidence": conf, "demo_valid": valid,
+                "spatial_valid": spatial_valid,
+                "spatial_feature_norm": spatial_norm.detach()}
 
 
 class RuleConditionedDecoder(nn.Module):

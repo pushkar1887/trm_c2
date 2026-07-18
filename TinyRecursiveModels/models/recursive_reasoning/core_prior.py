@@ -38,6 +38,7 @@ if __name__ == "__main__" and __package__ in (None, ""):
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 import collections  # noqa: F401  -- C12: top-level (used from §3 onward, was 3 function-body imports)
+import copy  # cache hardening (audit A4): _INFER_CACHE hands out private deepcopies, never the stored ref
 
 import torch  # noqa: F401  -- used from §2 onward
 import torch.nn as nn  # noqa: F401  -- used by ObjectRuleBank (§10)
@@ -87,6 +88,18 @@ _DIRS = {"N": (-1, 0), "S": (1, 0), "W": (0, -1), "E": (0, 1)}
 # membership assert `set(emitted) <= set(RULE_FAMILIES)` is WIRED at emit-time in §9 (Block 7),
 # which turns this from documentation into a load-bearing contract.
 RULE_FAMILIES = ("size_change", "recolor", "rearrange", "identity")
+
+# Independent operation factors for neural composition. Unlike RULE_FAMILIES these are not mutually
+# exclusive: a demonstration can both move and recolour an intact object.
+RULE_FACTOR_NAMES = (
+    "extent_same", "extent_grow", "extent_shrink",
+    "colour_copy", "colour_recolour",
+    "move_none", "move_up", "move_down", "move_left", "move_right",
+    "count_preserved", "count_created", "count_deleted",
+)
+RULE_FACTOR_INDEX = {name: i for i, name in enumerate(RULE_FACTOR_NAMES)}
+# Increment whenever a factor keeps its width/name but changes semantic meaning.
+RULE_FACTOR_SEMVER = 2
 
 # --- frame vocabulary (feeds trm_fvr_c2 frame_embed; one entry per resolver + "none") -----------
 # LEGACY prefix (frozen, order pinned) + D7: "rotate" APPENDED LAST for the D5 rotate resolver
@@ -262,7 +275,7 @@ def _match(oi: list, oo: list, keys=("colour", "size", "shape"), *, return_ambig
     every equality key in `keys`; among agreeing unused outputs the nearest centroid (L1) wins.
     Position-free on the shape key -> robust to movement.
 
-    keys understood: 'colour', 'size', 'shape' (D4-canonical, position-free).
+    keys understood: 'colour', 'size', 'shape' (D4-canonical, position-free), 'holes'.
     D10 (opt-in): return_ambiguity -> also return a parallel list `n_candidates` -- how many unused
     outputs satisfied the key-equality for each matched input BEFORE the centroid tie-break. That is a
     free match-confidence signal (1 == unambiguous). Default False keeps the legacy return (pairs)."""
@@ -279,6 +292,9 @@ def _match(oi: list, oo: list, keys=("colour", "size", "shape"), *, return_ambig
                     return False
             elif k == "shape":
                 if sig[id(b)] != sig[id(a)]:
+                    return False
+            elif k == "holes":
+                if _hole_count(b) != _hole_count(a):
                     return False
         return True
 
@@ -297,6 +313,44 @@ def _match(oi: list, oo: list, keys=("colour", "size", "shape"), *, return_ambig
     if return_ambiguity:
         return pairs, ambig
     return pairs
+
+
+def object_correspondences(input_tokens: torch.Tensor, output_tokens: torch.Tensor, side: int) -> dict:
+    """Colour-agnostic object correspondences for neural support memory.
+
+    D4 shape, area, and hole count establish identity; centroid distance only breaks ties. Unmatched
+    objects are retained as creation/deletion evidence instead of being silently discarded.
+    """
+    xi, _ = _compact_colour(input_tokens.detach().cpu(), side)
+    yo, _ = _compact_colour(output_tokens.detach().cpu(), side)
+    if xi is None or yo is None:
+        return {"matched": [], "created": [], "deleted": [], "coverage": 0.0, "precision_proxy": 0.0}
+    oi = _objects(xi, _background(xi))
+    oo = _objects(yo, _background(yo))
+    pairs, ambiguity = _match(
+        oi, oo, keys=("size", "shape", "holes"), return_ambiguity=True)
+    matched_i = {id(a) for a, _ in pairs}
+    matched_o = {id(b) for _, b in pairs}
+    matched = []
+    for (a, b), n_candidates in zip(pairs, ambiguity):
+        matched.append({
+            "input_cells": tuple(sorted(a["cells"])),
+            "output_cells": tuple(sorted(b["cells"])),
+            "dy": float(b["cr"] - a["cr"]),
+            "dx": float(b["cc"] - a["cc"]),
+            "confidence": 1.0 / max(int(n_candidates), 1),
+        })
+    created = [tuple(sorted(o["cells"])) for o in oo if id(o) not in matched_o]
+    deleted = [tuple(sorted(o["cells"])) for o in oi if id(o) not in matched_i]
+    denom = max(len(oi), len(oo), 1)
+    return {
+        "matched": matched,
+        "created": created,
+        "deleted": deleted,
+        "coverage": len(matched) / float(denom),
+        "precision_proxy": (
+            sum(m["confidence"] for m in matched) / max(len(matched), 1)),
+    }
 
 
 def _match_by_shape(oi: list, oo: list) -> list:
@@ -1001,62 +1055,79 @@ def _demos_from_support(support_in: torch.Tensor, support_out: torch.Tensor, sid
     return demos or None
 
 
-def _reconstructs(apply_fn, demos) -> bool:
+def _reconstructs(apply_fn, demos, masked_equal: bool = False) -> bool:
     """Does the frame reconstruct EVERY demo output exactly? The verify-exact gate that makes an
-    otherwise-DSL frame safe: no frame may touch the test input until it has explained all demos."""
+    otherwise-DSL frame safe: no frame may touch the test input until it has explained all demos.
+
+    C4 (audit A7) `masked_equal`: compact grids carry -1 at non-colour cells inside the bbox
+    (interior EOS/PAD -- _compact_colour's contract), but _render paints those as bg, so under the
+    default exact compare such demos are UNVERIFIABLE by every frame. When on, -1 output cells are
+    WILDCARDS: compare only where co >= 0 (an all-wildcard demo still refuses -- vacuous verify is
+    not verify). Default off = bit-identical to the pre-A7 gate."""
     for ci, co in demos:
         p = apply_fn(ci)
-        if p is None or p.shape != co.shape or not bool(torch.equal(p, co)):
+        if p is None or p.shape != co.shape:
+            return False
+        if masked_equal:
+            m = co >= 0
+            if not bool(m.any()) or not bool(torch.equal(p[m], co[m])):
+                return False
+        elif not bool(torch.equal(p, co)):
             return False
     return True
 
 
 def _propose_recipes_cached(support_in: torch.Tensor, support_out: torch.Tensor, side: int, demos: list):
     """C7: memoize _propose_recipes(demos) on (support-bytes, side). The recipes are pure functions of
-    the support, so the cached (apply_fn, meta) list is safe to reuse across targets. Bounded FIFO."""
+    the support, so the cached (apply_fn, meta) list is safe to reuse across targets. Bounded FIFO.
+    A4: stored/returned as a TUPLE -- list-level mutation by a consumer cannot poison the cache
+    (closures preclude deepcopy, so the tuple is the enforceable boundary here)."""
     key = (support_in.detach().cpu().contiguous().numpy().tobytes(),
            support_out.detach().cpu().contiguous().numpy().tobytes(), int(side))
     hit = _PROPOSE_CACHE.get(key)
     if hit is not None:
         _PROPOSE_CACHE.move_to_end(key)
         return hit
-    recipes = _propose_recipes(demos)
+    recipes = tuple(_propose_recipes(demos))
     _PROPOSE_CACHE[key] = recipes
     if len(_PROPOSE_CACHE) > _PROPOSE_CACHE_MAX:
         _PROPOSE_CACHE.popitem(last=False)
     return recipes
 
 
-def task_frame_label(support_in: torch.Tensor, support_out: torch.Tensor, side: int) -> int:
+def task_frame_label(support_in: torch.Tensor, support_out: torch.Tensor, side: int,
+                     *, masked_equal: bool = False) -> int:
     """The verified rearrange-FRAME family of a task (index into FRAME_VOCAB; 0 = none) from its demos.
     This is the narrowing 'rule hypothesis' fed to the TRM (Lane B) -- the operation family the
     deterministic solver verified, NOT the solved grid. Cheap: stops at the first frame reconstructing
-    all demos. no-grad."""
+    all demos. no-grad. masked_equal: C4 wildcard verify (see _reconstructs); default off."""
     demos = _demos_from_support(support_in, support_out, side)
     if demos is None:
         return 0
     for apply_fn, meta in _propose_recipes_cached(support_in, support_out, side, demos):
         try:
-            if _reconstructs(apply_fn, demos):
+            if _reconstructs(apply_fn, demos, masked_equal=masked_equal):
                 return FRAME_TO_IDX.get(meta[0], 0)
         except Exception:
             continue
     return 0
 
 
-def task_frame_labels_ranked(support_in: torch.Tensor, support_out: torch.Tensor, side: int) -> list:
+def task_frame_labels_ranked(support_in: torch.Tensor, support_out: torch.Tensor, side: int,
+                             *, masked_equal: bool = False) -> list:
     """D9: like task_frame_label but returns ALL frame indices (into FRAME_VOCAB) that reconstruct EVERY
     demo, in proposal order, deduplicated -- not just the first. `task_frame_label` == ranked[0] when
     non-empty (both walk legacy-first, so the canonical first element is unchanged). When two rules fit
     the demos that ambiguity is signal, not noise: a multi-hot frame vector is strictly more informative
-    for frame_embed's successor. EVIDENCE-only; never raises; empty list when nothing verifies."""
+    for frame_embed's successor. EVIDENCE-only; never raises; empty list when nothing verifies.
+    masked_equal: C4 wildcard verify (see _reconstructs); default off."""
     demos = _demos_from_support(support_in, support_out, side)
     if demos is None:
         return []
     out = []
     for apply_fn, meta in _propose_recipes_cached(support_in, support_out, side, demos):
         try:
-            if _reconstructs(apply_fn, demos):
+            if _reconstructs(apply_fn, demos, masked_equal=masked_equal):
                 idx = FRAME_TO_IDX.get(meta[0], 0)
                 if idx not in out:
                     out.append(idx)
@@ -1066,11 +1137,12 @@ def task_frame_labels_ranked(support_in: torch.Tensor, support_out: torch.Tensor
 
 
 def rearrange_candidate(support_in: torch.Tensor, support_out: torch.Tensor, target_in: torch.Tensor,
-                        side: int, return_meta: bool = False):
+                        side: int, return_meta: bool = False, *, masked_equal: bool = False):
     """The position-analogy solver. Propose frame x key recipes from the demos, keep the FIRST that
     reconstructs EVERY demo exactly, apply it to target_in. Returns flat tokens [side*side] or None.
 
-    support_in/out: [m, L] tokens; target_in: [L] tokens. (return_meta -> (pred, meta))."""
+    support_in/out: [m, L] tokens; target_in: [L] tokens. (return_meta -> (pred, meta)).
+    masked_equal: C4 wildcard verify (see _reconstructs); default off."""
     demos = _demos_from_support(support_in, support_out, side)
     if demos is None:
         return (None, None) if return_meta else None
@@ -1079,7 +1151,7 @@ def rearrange_candidate(support_in: torch.Tensor, support_out: torch.Tensor, tar
         return (None, None) if return_meta else None
     for apply_fn, meta in _propose_recipes_cached(support_in, support_out, side, demos):
         try:
-            if _reconstructs(apply_fn, demos):
+            if _reconstructs(apply_fn, demos, masked_equal=masked_equal):
                 out = apply_fn(tc)
                 if out is None:
                     continue
@@ -1091,10 +1163,11 @@ def rearrange_candidate(support_in: torch.Tensor, support_out: torch.Tensor, tar
 
 
 def rearrange_candidates(support_in: torch.Tensor, support_out: torch.Tensor, target_in: torch.Tensor,
-                         side: int, k: int = 2):
+                         side: int, k: int = 2, *, masked_equal: bool = False):
     """Up to k DISTINCT verified candidates for target_in (the ARC 2-attempt budget / verifier feed).
     Multiple frames can reconstruct the demos; the first is not always the test-correct one, so we
-    expose the top-k distinct predictions. Returns [(pred_tokens[L], meta), ...]."""
+    expose the top-k distinct predictions. Returns [(pred_tokens[L], meta), ...].
+    masked_equal: C4 wildcard verify (see _reconstructs); default off."""
     demos = _demos_from_support(support_in, support_out, side)
     if demos is None:
         return []
@@ -1104,7 +1177,7 @@ def rearrange_candidates(support_in: torch.Tensor, support_out: torch.Tensor, ta
     out_list = []; seen = set()
     for apply_fn, meta in _propose_recipes_cached(support_in, support_out, side, demos):
         try:
-            if not _reconstructs(apply_fn, demos):
+            if not _reconstructs(apply_fn, demos, masked_equal=masked_equal):
                 continue
             out = apply_fn(tc)
             if out is None:
@@ -1249,14 +1322,17 @@ def infer_rule_hypotheses(support_in: torch.Tensor, support_out: torch.Tensor, s
     hypothesis also carries {binding (hashable tuple), binding_consistency "n/r"}. Ordered by score.
     The first top_k are what a live bus would feed the TRM as evidence tokens.
 
-    C7: memoized on (support-bytes, side) -- this is a per-forward CPU loop in the live model. The
-    returned list is treated as READ-ONLY evidence (the live consumer only reads hyp[i][...])."""
+    C7: memoized on (support-bytes, side) -- this is a per-forward CPU loop in the live model.
+    A4: the cache stores a PRIVATE deepcopy and hands out deepcopies on hit, so no caller ever
+    holds a reference to the cached object -- a consumer mutating hyp[i][...] can no longer
+    poison every later same-support call (was prose-only "READ-ONLY" before; relation_map's sig
+    cache already paid this cost via .clone())."""
     key = (support_in.detach().cpu().contiguous().numpy().tobytes(),
            support_out.detach().cpu().contiguous().numpy().tobytes(), int(side))
     hit = _INFER_CACHE.get(key)
     if hit is not None:
         _INFER_CACHE.move_to_end(key)
-        return hit
+        return copy.deepcopy(hit)
     m = int(support_in.shape[0])
     fams = []; binds = []
     for k in range(m):
@@ -1297,8 +1373,8 @@ def infer_rule_hypotheses(support_in: torch.Tensor, support_out: torch.Tensor, s
                     h["binding"] = top_b
                     h["binding_consistency"] = f"{bn}/{c}"
         ranked.append(h)
-    _INFER_CACHE[key] = ranked
-    if len(_INFER_CACHE) > _INFER_CACHE_MAX:
+    _INFER_CACHE[key] = copy.deepcopy(ranked)   # A4: private copy -- the miss-path caller's ref
+    if len(_INFER_CACHE) > _INFER_CACHE_MAX:    # cannot alias (and later poison) the cached object
         _INFER_CACHE.popitem(last=False)
     return ranked
 
@@ -1668,6 +1744,227 @@ def evidence_rule_hypotheses(support_in: torch.Tensor, support_out: torch.Tensor
             if h["family"] in _RULE_FAMILY_IDX:
                 vec[_RULE_FAMILY_IDX[h["family"]]] = float(h["score"])
         return vec, float(hyps[0]["score"]), "rule_hypotheses"
+    except Exception:
+        return neutral
+
+
+def evidence_rule_factors(
+    support_in: torch.Tensor,
+    support_out: torch.Tensor,
+    side: int,
+    support_mask: torch.Tensor | None = None,
+):
+    """Infer independent support-consistent operation factors without proposing an output.
+
+    Matching is deliberately colour-agnostic: D4 shape and area identify an intact transported
+    object, then colour and displacement are measured as separate factors. This lets one support
+    pair express ``move_right`` and ``colour_recolour`` simultaneously instead of forcing one
+    exclusive family label.
+    """
+    if support_in.ndim != 2 or support_out.shape != support_in.shape:
+        raise ValueError("support_in/support_out must have shape [M, side*side]")
+    if support_in.shape[-1] != side * side:
+        raise ValueError(f"side={side} is incompatible with length={support_in.shape[-1]}")
+    device = support_in.device
+    mask = (torch.ones(support_in.shape[0], dtype=torch.bool, device=device)
+            if support_mask is None else support_mask.to(device=device, dtype=torch.bool).view(-1))
+
+    extent_votes = []
+    count_votes = []
+    colour_votes = []
+    move_votes = []
+    displacements = []
+    bbox_deltas = []
+    matched_total = 0
+    object_total = 0
+    ambiguity_total = 0.0
+    created_total = 0
+    deleted_total = 0
+
+    with torch.no_grad():
+        for m in mask.nonzero(as_tuple=True)[0].tolist():
+            xi, shape_i = _compact_colour(support_in[m].detach().cpu(), side)
+            yo, shape_o = _compact_colour(support_out[m].detach().cpu(), side)
+            if xi is None or yo is None:
+                continue
+            hi, wi = shape_i
+            ho, wo = shape_o
+            if (ho, wo) == (hi, wi):
+                extent_votes.append("extent_same")
+            elif ho * wo > hi * wi:
+                extent_votes.append("extent_grow")
+            else:
+                extent_votes.append("extent_shrink")
+
+            # Colour intent is a task-level property, so each demonstration gets one vote.
+            # Object-pair colours alone miss background fills and overweight demos with many
+            # matched objects. Histogram equality is deliberately conservative: it reports
+            # recolour only when the demonstration proves that colour mass changed.
+            colour_votes.append(
+                "colour_copy" if _hist10(xi) == _hist10(yo) else "colour_recolour")
+
+            oi = _objects(xi, _background(xi))
+            oo = _objects(yo, _background(yo))
+            object_total += max(len(oi), len(oo))
+            if len(oi) == len(oo):
+                count_votes.append("count_preserved")
+            elif len(oo) > len(oi):
+                count_votes.append("count_created")
+            else:
+                count_votes.append("count_deleted")
+
+            pairs, ambiguity = _match(
+                oi, oo, keys=("size", "shape"), return_ambiguity=True)
+            matched_total += len(pairs)
+            ambiguity_total += sum(1.0 / max(int(n), 1) for n in ambiguity)
+            matched_outputs = {id(b) for _, b in pairs}
+            created_total += max(0, len(oo) - len(matched_outputs))
+            deleted_total += max(0, len(oi) - len(pairs))
+
+            if not pairs and torch.equal(xi, yo):
+                move_votes.append("move_none")
+            for a, b in pairs:
+                dy = int(round(float(b["cr"] - a["cr"])))
+                dx = int(round(float(b["cc"] - a["cc"])))
+                displacements.append((dy, dx))
+                bbox_deltas.append((
+                    (b["rmax"] - b["rmin"]) - (a["rmax"] - a["rmin"]),
+                    (b["cmax"] - b["cmin"]) - (a["cmax"] - a["cmin"]),
+                ))
+                if dy == 0 and dx == 0:
+                    move_votes.append("move_none")
+                elif abs(dx) >= abs(dy):
+                    move_votes.append("move_right" if dx > 0 else "move_left")
+                else:
+                    move_votes.append("move_down" if dy > 0 else "move_up")
+
+    scores = torch.zeros(len(RULE_FACTOR_NAMES), dtype=torch.float32, device=device)
+
+    def assign(votes: list[str]) -> None:
+        if not votes:
+            return
+        denom = float(len(votes))
+        for name in set(votes):
+            scores[RULE_FACTOR_INDEX[name]] = votes.count(name) / denom
+
+    assign(extent_votes)
+    assign(count_votes)
+    assign(colour_votes)
+    assign(move_votes)
+
+    moving = [(dy, dx) for dy, dx in displacements if dy != 0 or dx != 0]
+    if moving:
+        counts = {}
+        for delta in moving:
+            counts[delta] = counts.get(delta, 0) + 1
+        dominant = max(counts, key=lambda delta: (counts[delta], -abs(delta[0]) - abs(delta[1])))
+        direction_consistency = counts[dominant] / float(len(moving))
+        dominant_dy, dominant_dx = dominant
+    else:
+        dominant_dy = dominant_dx = 0
+        direction_consistency = 1.0 if move_votes else 0.0
+
+    if bbox_deltas:
+        bbox_dh = sum(v[0] for v in bbox_deltas) / float(len(bbox_deltas))
+        bbox_dw = sum(v[1] for v in bbox_deltas) / float(len(bbox_deltas))
+    else:
+        bbox_dh = bbox_dw = 0.0
+    match_coverage = matched_total / float(max(object_total, 1))
+    same_shape_transport = match_coverage
+    match_confidence = ambiguity_total / float(max(matched_total, 1))
+    creation_conf = created_total / float(max(object_total, 1))
+    deletion_conf = deleted_total / float(max(object_total, 1))
+    return {
+        "scores": scores,
+        "confidence": scores.clone(),
+        "dominant_dy": torch.tensor(float(dominant_dy), device=device),
+        "dominant_dx": torch.tensor(float(dominant_dx), device=device),
+        "direction_consistency": torch.tensor(float(direction_consistency), device=device),
+        "bbox_dh": torch.tensor(float(bbox_dh), device=device),
+        "bbox_dw": torch.tensor(float(bbox_dw), device=device),
+        "same_shape_transport": torch.tensor(float(same_shape_transport), device=device),
+        "match_coverage": torch.tensor(float(match_coverage), device=device),
+        "match_confidence": torch.tensor(float(match_confidence), device=device),
+        "creation_confidence": torch.tensor(float(creation_conf), device=device),
+        "deletion_confidence": torch.tensor(float(deletion_conf), device=device),
+    }
+
+
+KINEMATIC_DIM = 7   # 0 mover | 1-2 signed (dr,dc) | 3-6 blocked up/down/left/right
+
+
+def evidence_kinematics(support_in: torch.Tensor, support_out: torch.Tensor,
+                        target_in: torch.Tensor, side: int):
+    """E-5 (audit A3): per-cell kinematic facts [L, KINEMATIC_DIM] + conf + tag. The per-cell substrate
+    of the rearrangement family -- until now these facts were computed and destroyed in place
+    (_rearrange_binding collapses the per-object disp list to one hashable tuple; _blocked_in_dir
+    answers one query bool; nothing per-cell ever left §9).
+
+    Columns: 0 mover mask (this cell's TARGET object is selected to move); 1-2 signed (dr,dc)
+    (translate: exact displacement / side; slide_to_edge / directional: unit sign vector -- the
+    magnitude is the slide engine's job, the recoverable token is the DIRECTION); 3-6 blocked
+    up/down/left/right on the TARGET INPUT (pure geometry, hypothesis-free, always emitted when
+    objects exist).
+
+    Movement cols (0-2) are live iff EVERY demo yields the SAME supported binding (translate /
+    slide_to_edge / directional via _rearrange_binding) AND the mover-vs-static colour split is
+    unambiguous (mover colours disjoint from static colours across all demos). Target objects with
+    UNSEEN colours are conservatively not selected. conf: 1.0 movement live, 0.5 blocked-only,
+    0.0 neutral. Uniform §10b contract: (grid, conf, tag), neutral on any failure, no-grad-safe."""
+    L = side * side
+    neutral = (torch.zeros(L, KINEMATIC_DIM), 0.0, "none")
+    try:
+        tc, _sh = _compact_colour(target_in, side)
+        if tc is None:
+            return neutral
+        bg_t = _background(tc)
+        t_objs = _objects(tc, bg_t)
+        if not t_objs:
+            return neutral
+        grid = torch.zeros(L, KINEMATIC_DIM)
+        # --- cols 3-6: blocked bits, target-input-only (no hypothesis needed) --------------------
+        for o in t_objs:
+            bits = [1.0 if _blocked_in_dir(tc, o["cells"], d, bg_t) else 0.0
+                    for d in ("up", "down", "left", "right")]
+            bt = torch.tensor(bits)
+            for (r, c) in o["cells"]:
+                if 0 <= r < side and 0 <= c < side:
+                    grid[r * side + c, 3:7] = bt
+        # --- cols 0-2: cross-demo movement rule (verified-consistent or nothing) -----------------
+        demos = _demos_from_support(support_in, support_out, side)
+        if demos is None:
+            return grid, 0.5, "kinematic:blocked-only"
+        binds = []
+        mover_cols: set = set()
+        static_cols: set = set()
+        for ci, co in demos:
+            b = _rearrange_binding(ci, co)
+            if b[0] not in ("translate", "slide_to_edge", "directional"):
+                return grid, 0.5, "kinematic:blocked-only"
+            binds.append(b)
+            bg = _background(ci)
+            for a, out in _match_objects(_objects(ci, bg), _objects(co, bg)):
+                dr = int(round(out["cr"] - a["cr"])); dc = int(round(out["cc"] - a["cc"]))
+                (mover_cols if (dr, dc) != (0, 0) else static_cols).add(int(a["colour"]))
+        if len(set(binds)) != 1 or (mover_cols & static_cols) or not mover_cols:
+            return grid, 0.5, "kinematic:blocked-only"
+        fam, arg = binds[0][0], binds[0][1]
+        if fam == "translate":
+            vec = (float(arg[0]) / side, float(arg[1]) / side)
+        else:                                   # slide_to_edge / directional carry a direction name
+            vec = {"down": (1.0, 0.0), "up": (-1.0, 0.0),
+                   "right": (0.0, 1.0), "left": (0.0, -1.0)}[arg]
+        select_all = not static_cols            # every matched object moved in every demo
+        for o in t_objs:
+            if not (select_all or int(o["colour"]) in mover_cols):
+                continue
+            for (r, c) in o["cells"]:
+                if 0 <= r < side and 0 <= c < side:
+                    idx = r * side + c
+                    grid[idx, 0] = 1.0
+                    grid[idx, 1] = vec[0]
+                    grid[idx, 2] = vec[1]
+        return grid, 1.0, f"kinematic:{fam}:{arg}"
     except Exception:
         return neutral
 

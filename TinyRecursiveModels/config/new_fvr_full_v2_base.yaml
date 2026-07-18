@@ -1,13 +1,14 @@
 # V2 base config for scripts/run_stage1_local.py --config config/stage1_local_v2_base.yaml
 #
 # COPY of checkpoints/TRM-FVR-Experiments/c2_geomaux_VALID_005_EOS0_AUG1000_step670_evalfull400_pid401/
-# all_config.yaml with EXACTLY three intentional diffs:
+# all_config.yaml with the V2 module switch plus explicit default-off redesign controls:
 #   1. arch.name -> recursive_reasoning.trm_fvr_v2 (the File #4 rewrite; step-0 byte-identical to
 #      trm_fvr_c2 at these flags -- proven by scripts/step0_identity_harness.py, blocks 0-8).
 #   2. run_name / checkpoint_path -> v2-suffixed so artifacts never collide with the old run's.
-#   3. This header.
-# Everything else (loss head losses_fvr@FVRACTLossHead, lrs, 518K load_checkpoint, batch, ACT) is
-# byte-identical. NOTE the yaml still pins c2_dual_output_head: false (the V3-1 silent-kill) --
+#   3. The ordered-evidence controls below default off. Legacy schema loading is explicitly allowed
+#      because this base intentionally warm-starts the pre-schema 518K checkpoint.
+# Core training settings (loss head losses_fvr@FVRACTLossHead, lrs, checkpoint, batch, ACT) remain
+# unchanged. NOTE the yaml still pins c2_dual_output_head: false (the V3-1 silent-kill) --
 # run_stage1_local's --v3-clean (default on) overrides it at runtime, same as with the old model.
 # The V2-only evidence flags (c2_verified_frame_evidence / c2_analogy_evidence / c2_value_ctx_gate /
 # c2_value_v2_backoff) are NOT set here: they default off in FVR_C2_Config and are switched per-run
@@ -44,6 +45,22 @@ arch:
   c2_lodo_blank_pid: false
   c2_modulate_pid: true
   c2_per_token_gate: false
+  c2_token_gate_where: false
+  c2_positive_where_gate: false
+  c2_gate_selector_detach: false
+  c2_ordered_evidence_flow: false
+  c2_bounded_evidence_fusion: false
+  c2_target_relmap_rho: 0.10
+  c2_post_hint_rho: 0.10
+  c2_update_rho: 0.15
+  c2_allow_legacy_evidence_schema: true
+  c2_canonical_value_binder: false
+  c2_value_backoff_tau: 3.0
+  c2_pairdelta_include_identity: false
+  c2_pairdelta_spatial: false
+  c2_rule_factor_hint: false
+  c2_object_pair_tokens: false
+  c2_extent_conditioned_structure: false
   c2_gate_dropout: 0.0
   c2_gate_l2_weight: 0.0
   c2_dual_output_head: false
@@ -64,6 +81,12 @@ arch:
     c2_shape_loss_weight: 0.0
     c2_valid_mask_loss_weight: 0.005
     c2_eos_loss_weight: 0.0
+    c2_gate_where_weight: 0.0
+    c2_gate_support_contrast_weight: 0.0
+    c2_value_ctx_bind_aux_weight: 0.0
+    c2_value_ctx_bind_aux_changed_weight: 3.0
+    c2_value_ctx_bind_aux_copy_weight: 2.0
+    c2_bind_residual_aware: false
 data_paths:
 - data/arc-agi-evaluation-full400-seed0
 data_paths_test: []

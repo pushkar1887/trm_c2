@@ -32,6 +32,8 @@ Token convention (repo-wide): PAD=0, EOS=1, colour = token-2 (0..9). Grids are s
 """
 from typing import Dict, Tuple
 
+from contextlib import nullcontext
+import hashlib
 import math
 from types import SimpleNamespace
 
@@ -94,6 +96,13 @@ assert set(RULE_FAMILY_VOCAB[1:]) == set(_RULE_FAMILIES), (
 
 # File #5: the pair-delta V2 evidence widths (schema-owned by pair_delta_v2, not hand-synced here).
 from models.recursive_reasoning.pair_delta_v2 import PD_BIDI_DIM, PD_COLOR_DIM, PD_STRUCT_DIM  # noqa: E402
+# E-5 (audit A3): kinematic evidence width (schema-owned by core_prior).
+from models.recursive_reasoning.core_prior import (  # noqa: E402
+    KINEMATIC_DIM,
+    RULE_FACTOR_NAMES,
+    RULE_FACTOR_SEMVER,
+)
+RULE_FACTOR_DIM = len(RULE_FACTOR_NAMES)
 
 # --- OUTPUT-side evidence columns (fed to color_evidence_proj). ORDER IS THE CONTRACT: it is the
 #     append order in _output_logits and the column layout of the zero-init projection. Legacy entries
@@ -114,7 +123,23 @@ EVIDENCE_COLS = (
     ("pd_color",       PD_COLOR_DIM,                                      "c2_pairdelta_color_evidence"), # D8 (File #5)
     ("pd_bidi",        PD_BIDI_DIM,                                       "c2_pairdelta_bidi_evidence"),  # D10 (SS7)
     ("value_ctx_bind", 20,                                                "c2_value_ctx_bind"),           # D11 (codex)
+    ("algo_touch",     14,                                                "c2_algo_where_touch"),         # D6 (B13)
+    ("kinematic",      KINEMATIC_DIM,                                     "c2_kinematic_evidence"),       # E-5 (A3)
+    ("canonical_bind", 10,                                                "c2_canonical_value_binder"),
 )
+# v3: canonical hierarchical keys define background by object attribution rather than ARC colour 0.
+# This is a semantic change at unchanged width, so interim v2 checkpoints must not load silently.
+# v4 (P1): canonical bind evidence is the RAW normalized distribution -- the same-position route no
+# longer multiplies it (route is confidence, not probability mass) and changed/copy support flags
+# are outcome-specific. Same ten-column width, different semantics: v3 checkpoints must not load
+# silently into the canonical consumer.
+EVIDENCE_SCHEMA_SEMVER = 4
+
+_CANONICAL_SUPPRESSED_EVIDENCE = frozenset({
+    "palette", "where_hint", "intent", "transition", "value_v2", "algo_where",
+    "value_ctx_gate", "verified_frame", "analogy", "pd_color", "pd_bidi",
+    "value_ctx_bind", "algo_touch", "kinematic",
+})
 
 
 def _col_width(width, cfg) -> int:
@@ -126,7 +151,10 @@ def evidence_layout(cfg) -> Tuple[list, int]:
     the hand `extra_cols` arithmetic AND the `evidence_parts`/`v2_col_offset` bookkeeping."""
     layout = []
     off = 0
+    canonical = bool(getattr(cfg, "c2_canonical_value_binder", False))
     for name, width, flag in EVIDENCE_COLS:
+        if canonical and name in _CANONICAL_SUPPRESSED_EVIDENCE:
+            continue
         if bool(getattr(cfg, flag, False)):
             w = _col_width(width, cfg)
             layout.append((name, w, off))
@@ -144,6 +172,79 @@ def evidence_slice(cfg, name: str):
         if n == name:
             return s, w
     return None
+
+
+def evidence_schema_fingerprint(cfg) -> torch.Tensor:
+    """Stable semantic fingerprint for the active ordered evidence layout.
+
+    Width equality is insufficient for checkpoint compatibility: a ten-column palette block and a
+    ten-column transition block have different meanings. The digest therefore includes semantic
+    version, ordered names, widths, and offsets. It is represented as a persistent uint8 tensor so
+    normal checkpoint state-dict machinery can carry it without custom serialization.
+    """
+    active, total = evidence_layout(cfg)
+    semantic_inputs = []
+    if any(bool(getattr(cfg, flag, False)) for flag in (
+        "c2_rule_factor_hint",
+        "c2_object_pair_tokens",
+        "c2_extent_conditioned_structure",
+        "c2_canonical_value_binder",
+    )):
+        semantic_inputs.append(("rule_factors", RULE_FACTOR_SEMVER))
+    if bool(getattr(cfg, "c2_pairdelta_spatial", False)):
+        semantic_inputs.append(("pairdelta_spatial", 1))
+    payload = repr((
+        EVIDENCE_SCHEMA_SEMVER,
+        tuple(active),
+        total,
+        tuple(semantic_inputs),
+    )).encode("utf-8")
+    return torch.tensor(list(hashlib.sha256(payload).digest()), dtype=torch.uint8)
+
+
+def extent_conditioned_structure(
+    floor_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    same_extent_probability: torch.Tensor,
+) -> torch.Tensor:
+    """Route structure residuals by the support-derived same-extent probability.
+
+    ``p=1`` preserves the floor exactly; ``p=0`` permits the full candidate. Intermediate values
+    interpolate logits and keep gradients available to the existing structure head.
+    """
+    p = same_extent_probability.to(device=floor_logits.device, dtype=floor_logits.dtype)
+    while p.ndim < floor_logits.ndim:
+        p = p.unsqueeze(-1)
+    p = p.clamp(0.0, 1.0)
+    mixed = floor_logits + (1.0 - p) * (candidate_logits - floor_logits)
+    # Preserve the endpoint contracts byte-for-byte; the arithmetic interpolation can otherwise
+    # differ by one ULP from ``candidate_logits`` when p==0.
+    return torch.where(p >= 1.0, floor_logits, torch.where(p <= 0.0, candidate_logits, mixed))
+
+
+def bounded_residual(
+    base: torch.Tensor,
+    residual: torch.Tensor,
+    rho: float,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply a per-example residual norm budget and report raw/applied norm ratios."""
+    if base.shape != residual.shape:
+        raise ValueError(f"base/residual shape mismatch: {tuple(base.shape)} != {tuple(residual.shape)}")
+    dims = tuple(range(1, base.ndim))
+    base_norm = torch.linalg.vector_norm(base.float(), dim=dims).clamp_min(eps)
+    residual_norm = torch.linalg.vector_norm(residual.float(), dim=dims)
+    scale = torch.minimum(
+        torch.ones_like(base_norm),
+        float(rho) * base_norm / residual_norm.clamp_min(eps),
+    )
+    view_shape = (base.shape[0],) + (1,) * (base.ndim - 1)
+    applied = residual * scale.to(residual.dtype).view(view_shape)
+    return (
+        base + applied,
+        (residual_norm / base_norm).mean(),
+        ((residual_norm * scale) / base_norm).mean(),
+    )
 
 
 # --- PID-QUARANTINED candidate feature layout (fixed; independent of flags). Named offsets replace the
@@ -201,6 +302,19 @@ class FVR_C2_Config(TinyRecursiveReasoningModel_ACTV1Config):
     c2_lodo_blank_pid: bool = False
     c2_modulate_pid: bool = False
     c2_per_token_gate: bool = False
+    c2_token_gate_where: bool = False
+    c2_positive_where_gate: bool = False
+    c2_gate_selector_detach: bool = False
+    # --- P3A support-conditioned WHERE (Blocks 1-3; default-off, flag-off path bitwise unchanged) ---
+    c2_isolated_relmap_query: bool = False
+    c2_support_interaction_gate: bool = False
+    c2_lodo_zero_support: bool = False
+    c2_ordered_evidence_flow: bool = False
+    c2_bounded_evidence_fusion: bool = False
+    c2_target_relmap_rho: float = 0.10
+    c2_post_hint_rho: float = 0.10
+    c2_update_rho: float = 0.15
+    c2_allow_legacy_evidence_schema: bool = False
     c2_gate_dropout: float = 0.0
     c2_gate_l2_weight: float = 0.0
     # --- V3 factored output head + floor/candidate split ---
@@ -225,6 +339,8 @@ class FVR_C2_Config(TinyRecursiveReasoningModel_ACTV1Config):
     c2_pairdelta_intent_hint: bool = False
     c2_transition_hint: bool = False
     c2_value_evidence_v2: bool = False
+    c2_canonical_value_binder: bool = False
+    c2_value_backoff_tau: float = 3.0
     c2_value_v2_rich_ctx: bool = False
     c2_color_head_mlp_dim: int = 0
     # --- PID-quarantined candidate ---
@@ -233,6 +349,10 @@ class FVR_C2_Config(TinyRecursiveReasoningModel_ACTV1Config):
     # --- §15.2 cross-demo input-side upgrades ---
     c2_relmap_demos: bool = False
     c2_pairdelta_input_feature: bool = False
+    c2_pairdelta_include_identity: bool = False
+    c2_pairdelta_spatial: bool = False
+    c2_rule_factor_hint: bool = False
+    c2_object_pair_tokens: bool = False
     # --- geometry / structure heads + extent levers ---
     c2_geometry_aux_head: bool = True
     c2_relmap_structure: bool = True
@@ -249,6 +369,7 @@ class FVR_C2_Config(TinyRecursiveReasoningModel_ACTV1Config):
     c2_shape_head: bool = False
     c2_shape_pool: str = "zH_puzzle_gridmean"
     c2_structure_fusion_alpha: float = 0.0
+    c2_extent_conditioned_structure: bool = False
     # --- PairDelta encoder dims (the KEPT --pairdelta-input hint reuses these) ---
     c2_delta_rule_encoder_dim: int = 256
     c2_delta_rule_slots: int = 8
@@ -273,12 +394,13 @@ class FVR_C2_Config(TinyRecursiveReasoningModel_ACTV1Config):
     c2_analogy_evidence: bool = False         # D2 (E-2): analogy per-cell colour dist -> 11 EvCol columns
     c2_value_v2_backoff: bool = False         # D4 (=CF1/M1): collision-free ordered backoff context key
     c2_frame_hint_ranked: bool = False        # D5 (E-3): multi-hot ranked-frame hint
-    c2_algo_where_touch: bool = False         # D6: touch-colour signature cols 14/15 as algo evidence
+    c2_algo_where_touch: bool = False         # D6 (WIRED): touch-colour sig cols 14/15 -> 14 EvCol (10 mode + 4 count)
     c2_pairdelta_color_evidence: bool = False # D8 (File #5): cross-demo agreement + positional prior -> 14 EvCol
     c2_pairdelta_structure_evidence: bool = False  # D9 (File #5): verified extent-family masks -> zero-init [6->3] structure proj
     c2_pairdelta_bidi_evidence: bool = False  # D10 (SS7): y->x view (invertibility/deletion/dst-mass) -> 4 EvCol
     c2_pairdelta_input_conf_gate: bool = False  # SS7 reuse: gate the input rule_vec broadcast by rule_confidence
     c2_value_ctx_bind: bool = False           # D11 (codex): explicit gate x value product columns -> 20 EvCol
+    c2_kinematic_evidence: bool = False       # E-5 (A3): per-cell mover/(dr,dc)/blocked bits -> 7 EvCol
 
 
 def _select_heads(hidden_size: int, requested_heads: int, max_heads: int) -> int:
@@ -433,11 +555,55 @@ class TestConditionedC2(nn.Module):
         self.global_proj = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
         self.gate_patch = nn.Parameter(torch.tensor(float(config.c2_gate_init)))
         self.gate_global = nn.Parameter(torch.tensor(float(config.c2_gate_init)))
+        if self.config.c2_token_gate_where and not self.config.c2_per_token_gate:
+            raise ValueError("c2_token_gate_where requires c2_per_token_gate=True")
+        if self.config.c2_positive_where_gate and not self.config.c2_token_gate_where:
+            raise ValueError("c2_positive_where_gate requires c2_token_gate_where=True")
+        if self.config.c2_gate_selector_detach and not self.config.c2_positive_where_gate:
+            raise ValueError("c2_gate_selector_detach requires c2_positive_where_gate=True")
+        if self.config.c2_positive_where_gate and not self.config.c2_ordered_evidence_flow:
+            raise ValueError("c2_positive_where_gate requires c2_ordered_evidence_flow=True")
+        if self.config.c2_positive_where_gate and not self.config.c2_rel_where_hint:
+            raise ValueError("c2_positive_where_gate requires c2_rel_where_hint=True")
+        if self.config.c2_positive_where_gate and abs(float(self.config.c2_gate_init)) > 1e-12:
+            raise ValueError("c2_positive_where_gate requires c2_gate_init=0 for step-0 identity")
+        if self.config.c2_ordered_evidence_flow and not self.config.c2_relmap:
+            raise ValueError("c2_ordered_evidence_flow requires c2_relmap=True")
+        # P3A Block 1/2 validity: x_query only exists on the ordered flow, and the interaction
+        # gate reads x_query and needs the sigmoid selector for q in [0,1].
+        if (getattr(self.config, "c2_isolated_relmap_query", False)
+                and not self.config.c2_ordered_evidence_flow):
+            raise ValueError("c2_isolated_relmap_query requires c2_ordered_evidence_flow=True")
+        if getattr(self.config, "c2_support_interaction_gate", False):
+            if not getattr(self.config, "c2_isolated_relmap_query", False):
+                raise ValueError("c2_support_interaction_gate requires c2_isolated_relmap_query=True")
+            if not self.config.c2_positive_where_gate:
+                raise ValueError("c2_support_interaction_gate requires c2_positive_where_gate=True")
+            if not self.config.c2_gate_selector_detach:
+                raise ValueError(
+                    "c2_support_interaction_gate requires c2_gate_selector_detach=True: WHERE "
+                    "supervision owns the selector; transport losses must not rewrite it (P3A)")
         if self.config.c2_per_token_gate:
-            self.gate_patch_token = CastedLinear(config.hidden_size, 1, bias=True)
+            # The WHERE arm adds a zero-initialized module. Preserve the outer RNG stream so
+            # flag-on/off arms keep identical initialization for every module constructed later.
+            _fork_devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+            _rng_ctx = (
+                torch.random.fork_rng(devices=_fork_devices)
+                if self.config.c2_token_gate_where
+                else nullcontext()
+            )
+            with _rng_ctx:
+                self.gate_patch_token = CastedLinear(config.hidden_size, 1, bias=True)
             with torch.no_grad():
-                self.gate_patch_token.weight.zero_()
-                self.gate_patch_token.bias.fill_(float(config.c2_gate_init))
+                if self.config.c2_positive_where_gate:
+                    self.gate_patch_token.weight.normal_(mean=0.0, std=1e-3)
+                    self.gate_patch_token.bias.zero_()
+                else:
+                    self.gate_patch_token.weight.zero_()
+                    self.gate_patch_token.bias.fill_(float(config.c2_gate_init))
+        if self.config.c2_positive_where_gate:
+            self.where_gate_weights = nn.Parameter(torch.zeros(
+                max(1, int(getattr(config, "c2_rel_where_topk", 1))), dtype=torch.float32))
 
     def _masked_mean(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask_f = mask.to(x.dtype).unsqueeze(-1)
@@ -567,6 +733,69 @@ class TestConditionedC2(nn.Module):
         rule_mask = rule_mask.gather(1, order)
         return rule_bank, rule_mask
 
+    def _object_pair_memory(
+        self,
+        context_inputs: torch.Tensor,
+        context_outputs: torch.Tensor,
+        context_input_features: torch.Tensor,
+        context_output_features: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor | None, torch.Tensor | None, Dict[str, torch.Tensor]]:
+        """Pool colour-agnostic matched objects into the existing C2 pair-token space."""
+        from models.recursive_reasoning.core_prior import object_correspondences
+        B, M, L = context_inputs.shape
+        side = int(math.isqrt(L))
+        rows: list[list[torch.Tensor]] = [[] for _ in range(B)]
+        coverages = []
+        precisions = []
+
+        def pool(features: torch.Tensor, cells: tuple) -> torch.Tensor:
+            if not cells:
+                return features.new_zeros(features.shape[-1])
+            idx = torch.tensor(
+                [int(r) * side + int(c) for r, c in cells],
+                device=features.device, dtype=torch.long)
+            return features.index_select(0, idx).mean(dim=0)
+
+        for b in range(B):
+            for m in range(M):
+                if not bool(context_mask[b, m]):
+                    continue
+                corr = object_correspondences(context_inputs[b, m], context_outputs[b, m], side)
+                coverages.append(float(corr["coverage"]))
+                precisions.append(float(corr["precision_proxy"]))
+                for item in corr["matched"]:
+                    inp = pool(context_input_features[b, m], item["input_cells"])
+                    out = pool(context_output_features[b, m], item["output_cells"])
+                    rows[b].append(torch.cat((inp, out, out - inp), dim=-1))
+                for cells in corr["created"]:
+                    out = pool(context_output_features[b, m], cells)
+                    rows[b].append(torch.cat((torch.zeros_like(out), out, out), dim=-1))
+                for cells in corr["deleted"]:
+                    inp = pool(context_input_features[b, m], cells)
+                    rows[b].append(torch.cat((inp, torch.zeros_like(inp), -inp), dim=-1))
+
+        max_tokens = max((len(row) for row in rows), default=0)
+        stats = {
+            "c2_object_pair_count": torch.tensor(
+                sum(len(row) for row in rows) / max(B, 1), device=context_inputs.device),
+            "c2_object_match_coverage": torch.tensor(
+                sum(coverages) / max(len(coverages), 1), device=context_inputs.device),
+            "c2_object_match_precision_proxy": torch.tensor(
+                sum(precisions) / max(len(precisions), 1), device=context_inputs.device),
+        }
+        if max_tokens == 0:
+            return None, None, stats
+        raw = context_input_features.new_zeros((B, max_tokens, self.config.hidden_size * 3))
+        mask = torch.zeros((B, max_tokens), device=context_inputs.device, dtype=torch.bool)
+        for b, row in enumerate(rows):
+            if row:
+                raw[b, :len(row)] = torch.stack(row)
+                mask[b, :len(row)] = True
+        tokens = self.pair_mix(F.silu(self.pair_proj(raw)))
+        tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
+        return tokens, mask, stats
+
     def expose_demo_encoding(
         self,
         context_inputs: torch.Tensor,
@@ -607,7 +836,21 @@ class TestConditionedC2(nn.Module):
         context_input_features: torch.Tensor,
         context_output_features: torch.Tensor,
         context_mask: torch.Tensor,
+        target_where_hint: torch.Tensor | None = None,
+        rule_factors: torch.Tensor | None = None,
+        target_query_features: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor | None]:
+        # P3A Block 1: under c2_isolated_relmap_query, `target_features` is x_base (the recurrence
+        # input, relmap-free) and `target_query_features` is x_query (x_base + bounded relmap
+        # residual). x_query feeds ONLY the cross-attention query and the WHERE gate; every update
+        # is added to x_base and x_query is never returned. Flag-off: query IS target (same
+        # tensor object), so the legacy path is bitwise unchanged.
+        _isolated = bool(getattr(self.config, "c2_isolated_relmap_query", False))
+        if _isolated and target_query_features is None:
+            raise ValueError("c2_isolated_relmap_query=True requires target_query_features (x_query)")
+        if not _isolated and target_query_features is not None:
+            raise ValueError("target_query_features passed without c2_isolated_relmap_query=True")
+        query_features = target_query_features if _isolated else target_features
         demo_tokens, token_mask, token_keys, changed_mask = self._demo_tokens(
             context_inputs=context_inputs,
             context_outputs=context_outputs,
@@ -615,10 +858,26 @@ class TestConditionedC2(nn.Module):
             context_output_features=context_output_features,
             context_mask=context_mask,
         )
+        if self.config.c2_object_pair_tokens and rule_factors is not None:
+            from models.recursive_reasoning.core_prior import RULE_FACTOR_INDEX
+            same_position = (
+                rule_factors[:, RULE_FACTOR_INDEX["extent_same"]]
+                * rule_factors[:, RULE_FACTOR_INDEX["move_none"]]
+            ) >= 0.5
+            token_mask = token_mask & same_position[:, None, None]
+            demo_tokens = demo_tokens * token_mask.unsqueeze(-1).to(demo_tokens.dtype)
         rule_bank, rule_mask = self._rule_bank(demo_tokens, token_mask, token_keys)
+        object_stats: Dict[str, torch.Tensor] = {}
+        if self.config.c2_object_pair_tokens:
+            object_tokens, object_mask, object_stats = self._object_pair_memory(
+                context_inputs, context_outputs, context_input_features,
+                context_output_features, context_mask)
+            if object_tokens is not None and object_mask is not None:
+                rule_bank = torch.cat((rule_bank, object_tokens), dim=1)
+                rule_mask = torch.cat((rule_mask, object_mask), dim=1)
 
         patch_context = self.cross_attn(
-            query=rms_norm(target_features, variance_epsilon=self.norm_eps),
+            query=rms_norm(query_features, variance_epsilon=self.norm_eps),
             key_value=rms_norm(rule_bank, variance_epsilon=self.norm_eps),
             key_mask=rule_mask,
         )
@@ -629,13 +888,47 @@ class TestConditionedC2(nn.Module):
 
         gate_global = torch.tanh(self.gate_global).to(target_features.dtype)
         if self.config.c2_per_token_gate:
-            normed_target = rms_norm(target_features, variance_epsilon=self.norm_eps)
-            gate_logits = self.gate_patch_token(normed_target).squeeze(-1)
-            gate_patch_per_token = torch.tanh(gate_logits).to(target_features.dtype)
+            normed_target = rms_norm(query_features, variance_epsilon=self.norm_eps)
+            if getattr(self.config, "c2_support_interaction_gate", False):
+                # P3A Block 2: multiplicative target x support interaction. The additive gate input
+                # let a support-blind bias dominate (M1: gate FPR 99.4% -- all-on); a product cannot
+                # be faked by either factor alone, and zero/foreign patch_context reshapes it
+                # directly. WHERE gradients still reach cross-attention through patch_context.
+                gate_input = normed_target * rms_norm(patch_context, variance_epsilon=self.norm_eps)
+            else:
+                gate_input = normed_target
+                if self.config.c2_token_gate_where:
+                    gate_input = gate_input + rms_norm(patch_context, variance_epsilon=self.norm_eps)
+            gate_logits = self.gate_patch_token(gate_input).squeeze(-1)
+            if self.config.c2_positive_where_gate:
+                if target_where_hint is not None:
+                    if target_where_hint.ndim != 3 or target_where_hint.shape[:2] != gate_logits.shape:
+                        raise ValueError(
+                            "target_where_hint must have shape [B,L,K], got "
+                            f"{tuple(target_where_hint.shape)} for gate {tuple(gate_logits.shape)}")
+                    if target_where_hint.shape[-1] != self.where_gate_weights.numel():
+                        raise ValueError(
+                            f"target_where_hint K={target_where_hint.shape[-1]} does not match "
+                            f"configured K={self.where_gate_weights.numel()}")
+                    gate_logits = gate_logits + (
+                        target_where_hint.to(gate_logits.dtype)
+                        * self.where_gate_weights.to(gate_logits.dtype).view(1, 1, -1)
+                    ).sum(dim=-1)
+                gate_patch_per_token = torch.sigmoid(gate_logits).to(target_features.dtype)
+            else:
+                gate_patch_per_token = torch.tanh(gate_logits).to(target_features.dtype)
             if self.training and self.config.c2_gate_dropout > 0:
                 keep = torch.rand_like(gate_patch_per_token.float()) > float(self.config.c2_gate_dropout)
                 gate_patch_per_token = gate_patch_per_token * keep.to(gate_patch_per_token.dtype)
             gate_patch_field = gate_patch_per_token.unsqueeze(-1)
+            # Repair A: WHERE supervision owns the selector. Candidate colour/transport losses may
+            # still train the C2 update strengths and content projections, but must not rewrite the
+            # changed-cell selector through this multiplication path.
+            gate_patch_transport_field = (
+                gate_patch_field.detach()
+                if self.config.c2_gate_selector_detach
+                else gate_patch_field
+            )
             gate_patch_scalar_metric = gate_patch_per_token.float().mean().detach()
             gate_patch_abs_metric = gate_patch_per_token.float().abs().mean().detach()
             gate_patch_std_metric = gate_patch_per_token.float().std().detach()
@@ -643,14 +936,23 @@ class TestConditionedC2(nn.Module):
         else:
             gate_patch_scalar = torch.tanh(self.gate_patch).to(target_features.dtype)
             gate_patch_field = gate_patch_scalar
+            gate_patch_transport_field = gate_patch_field
             gate_patch_scalar_metric = torch.tanh(self.gate_patch.float()).detach()
             gate_patch_abs_metric = torch.tanh(self.gate_patch.float()).abs().detach()
             gate_patch_std_metric = torch.zeros((), device=target_features.device).detach()
             gate_patch_l2 = torch.zeros((), device=target_features.device, dtype=torch.float32)
 
-        patch_update = gate_patch_field * rms_norm(patch_context, variance_epsilon=self.norm_eps)
-        global_update = gate_global * rms_norm(global_context, variance_epsilon=self.norm_eps)
-        update = patch_update + global_update
+        if self.config.c2_positive_where_gate:
+            gate_patch_strength = torch.tanh(self.gate_patch).to(target_features.dtype)
+            patch_update = gate_patch_transport_field * gate_patch_strength * rms_norm(
+                patch_context, variance_epsilon=self.norm_eps)
+            global_update = gate_patch_transport_field * gate_global * rms_norm(
+                global_context, variance_epsilon=self.norm_eps)
+            update = patch_update + global_update
+        else:
+            patch_update = gate_patch_field * rms_norm(patch_context, variance_epsilon=self.norm_eps)
+            global_update = gate_global * rms_norm(global_context, variance_epsilon=self.norm_eps)
+            update = patch_update + global_update
         # DIAGNOSTIC-ONLY forced-signal amplifier (run_stage1_local --zh-amp): default 1.0 == no-op.
         _amp = float(getattr(self, "_demo_injection_scale", 1.0))
         if _amp != 1.0:
@@ -659,7 +961,13 @@ class TestConditionedC2(nn.Module):
         patch_update_norm = patch_update.float().norm(dim=-1).mean()
         global_update_norm = global_update.float().norm(dim=-1).mean()
         update_norm = update.float().norm(dim=-1).mean()
-        target_features = target_features + update
+        if self.config.c2_bounded_evidence_fusion:
+            target_features, raw_update_ratio, applied_update_ratio = bounded_residual(
+                target_features, update, float(self.config.c2_update_rho))
+        else:
+            target_features = target_features + update
+            raw_update_ratio = update_norm / target_norm
+            applied_update_ratio = raw_update_ratio
         valid_possible = context_mask.float().sum().clamp_min(1) * context_inputs.shape[-1]
         valid_count = token_mask.float().sum().clamp_min(1)
 
@@ -675,13 +983,20 @@ class TestConditionedC2(nn.Module):
             "c2_gate_patch_l2": gate_patch_l2,
             "c2_gate_global_abs": torch.tanh(self.gate_global.float()).abs().detach(),
             "c2_context_count": context_mask.float().sum(dim=-1).mean().detach(),
-            "c2_update_norm_ratio": (update_norm / target_norm).detach(),
+            "c2_update_norm_ratio": applied_update_ratio.detach(),
+            "c2_update_raw_norm_ratio": raw_update_ratio.detach(),
+            "c2_update_applied_norm_ratio": applied_update_ratio.detach(),
             "c2_patch_update_norm_ratio": (patch_update_norm / target_norm).detach(),
             "c2_global_update_norm_ratio": (global_update_norm / target_norm).detach(),
             "c2_rule_bank_token_count": rule_mask.float().sum(dim=-1).mean().detach(),
             "c2_changed_token_frac": (changed_mask.float().sum() / valid_count).detach(),
             "c2_valid_token_frac": (token_mask.float().sum() / valid_possible).detach(),
         }
+        metrics.update({k: v.detach() for k, v in object_stats.items()})
+        if self.config.c2_token_gate_where:
+            # Kept attached for the LODO WHERE loss. Scalar panel aggregators ignore this [B,L]
+            # tensor; _run_aux_logits explicitly threads it to correct/shuffled aux outputs.
+            metrics["c2_gate_where_values"] = gate_patch_per_token
         return target_features, metrics, pid_task_vec
 
 
@@ -847,6 +1162,75 @@ class C2EvidenceMixin:
             maps[..., 1:11] = encl_oh
             maps[..., 11:21] = seed_oh
             return maps
+
+    def _evidence_algo_touch(
+        self,
+        batch: Dict[str, torch.Tensor] | None,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """D6 (B13 close-out): [B,L,14] touch-colour evidence from cell_conditioning_signature cols 14/15.
+
+        ch0..9 = touch_colour_mode one-hot (modal non-bg colour 4-adjacent to this cell's object;
+        bg cells inherit their enclosing object's value; sentinel 10 = no touch -> all-zero);
+        ch10..13 = touch_colour_count bucket one-hot (0/1/2/3+; sentinel 4 = no attribution ->
+        all-zero). The substrate of the neighbour-conditioned recolor primitive: the signature has
+        known "what TOUCHES my object" since File #1 (B13) -- nothing read it until this column.
+        Target INPUT only (never any output => LODO/holdout-safe by construction), no_grad,
+        evidence columns only -- never a writer. Same delivery pattern as _algo_where_maps.
+        """
+        zeros = torch.zeros((batch_size, seq_len, 14), device=device, dtype=torch.float32)
+        ti = batch.get("inputs") if batch is not None else None
+        if ti is None or ti.shape[0] != batch_size or ti.shape[-1] != seq_len:
+            return zeros
+        side = int(math.isqrt(int(seq_len)))
+        if side * side != int(seq_len):
+            return zeros
+        from models.recursive_reasoning.relation_map import cell_conditioning_signature   # M11
+        with torch.no_grad():
+            csig, _valid = cell_conditioning_signature(ti.reshape(-1, seq_len).to("cpu"), side)
+            if csig.shape[-1] < 16:                       # signature predates cols 14/15 -> no evidence
+                return zeros
+            touch = csig[..., 14].to(device)              # 0..9 modal touching colour, 10 = none
+            cnt = csig[..., 15].to(device)                # 0..3 distinct-count bucket, 4 = none
+            maps = zeros.clone()
+            maps[..., 0:10] = F.one_hot(touch.clamp(0, 10), num_classes=11)[..., :10].float()
+            maps[..., 10:14] = F.one_hot(cnt.clamp(0, 4), num_classes=5)[..., :4].float()
+            return maps
+
+    def _evidence_kinematic(
+        self, batch: Dict[str, torch.Tensor] | None, batch_size: int, seq_len: int, device: torch.device,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """E-5 / A3: [B, L, KINEMATIC_DIM] per-cell kinematic facts -- mover mask, signed (dr,dc),
+        blocked-direction bits (see core_prior.evidence_kinematics). Movement cols live only under a
+        cross-demo-consistent verified binding; blocked bits are target-input geometry. LODO-safe:
+        reads the `_active_context_*` support. Per-row CPU under no_grad (same lane as D1/D2)."""
+        out = torch.zeros((batch_size, seq_len, KINEMATIC_DIM), device=device, dtype=torch.float32)
+        stats: Dict[str, torch.Tensor] = {}
+        ci, co, cm = self._active_context(batch)
+        ti = batch.get("inputs") if batch is not None else None
+        if ci is None or co is None or ti is None or ti.ndim != 2:
+            return out, stats
+        from models.recursive_reasoning.core_prior import evidence_kinematics
+        side = int(math.isqrt(seq_len))
+        conf_sum = 0.0
+        with torch.no_grad():
+            ci_c = ci.detach().to("cpu", torch.long); co_c = co.detach().to("cpu", torch.long)
+            ti_c = ti.detach().to("cpu", torch.long)
+            cm_c = (cm.detach().to("cpu").bool() if cm is not None
+                    else torch.ones(ci.shape[:2], dtype=torch.bool))
+            for b in range(batch_size):
+                keep = cm_c[b].nonzero(as_tuple=True)[0]
+                if keep.numel() == 0:
+                    continue
+                grid, conf, _prov = evidence_kinematics(ci_c[b][keep], co_c[b][keep], ti_c[b], side)
+                if conf > 0:
+                    out[b] = grid.to(device)
+                conf_sum += float(conf)
+        stats["kin_mover_mass"] = out[..., 0].mean().detach()
+        stats["kin_conf"] = torch.tensor(conf_sum / max(1, batch_size))
+        return out, stats
 
     def _value_context_signature(
         self,
@@ -1118,6 +1502,195 @@ class C2EvidenceMixin:
             stats["c2_value_v2_where_mass"] = features[..., 26:36].sum(dim=-1)[target >= 2].mean() if bool((target >= 2).any()) else torch.zeros((), device=device)
         return features, stats, ctx_gate, ctx_bind
 
+    def _canonical_value_binding(
+        self,
+        batch: Dict[str, torch.Tensor] | None,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> Tuple[
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+    ]:
+        """One support-derived colour authority with exact task-local context keys.
+
+        The binder is deliberately same-position only. Independent operation factors route it off
+        for movement or extent-changing tasks, preventing a recolour table from writing values into
+        cells whose source object came from another position.
+        """
+        distribution = torch.zeros((batch_size, seq_len, 10), device=device, dtype=torch.float32)
+        supported = torch.zeros((batch_size, seq_len), device=device, dtype=torch.bool)
+        changed_supported = torch.zeros_like(supported)
+        copy_supported = torch.zeros_like(supported)
+        # P1: distribution / route / reliability are carried SEPARATELY -- the route no longer
+        # multiplies the distribution (confidence, not probability mass), so P_bind stays a
+        # normalized simplex and downstream consumers decide applicability themselves.
+        marginal = torch.zeros_like(distribution)
+        route_map = torch.zeros((batch_size, seq_len), device=device, dtype=torch.float32)
+        reliability = torch.zeros_like(route_map)
+        per_cell = {
+            "marginal": marginal,
+            "route": route_map,
+            "reliability": reliability,
+        }
+        stats = {
+            "c2_canonical_bind_same_position_route": torch.zeros((), device=device),
+            "c2_canonical_bind_same_extent": torch.zeros((), device=device),
+            "c2_canonical_bind_histogram_change": torch.zeros((), device=device),
+            "c2_canonical_bind_movement": torch.zeros((), device=device),
+            "c2_canonical_bind_support_coverage": torch.zeros((), device=device),
+            "c2_canonical_bind_changed_support_coverage": torch.zeros((), device=device),
+            "c2_canonical_bind_copy_support_coverage": torch.zeros((), device=device),
+            "c2_canonical_bind_key_collisions": torch.zeros((), device=device),
+        }
+        ci, co, cm = self._active_context(batch)
+        ti = batch.get("inputs") if batch is not None else None
+        if ci is None or co is None or ti is None or ti.ndim != 2:
+            return distribution, stats, supported, changed_supported, copy_supported, per_cell
+
+        from models.recursive_reasoning.relation_map import (
+            cell_conditioning_signature,
+            hierarchical_value_binding,
+        )
+        from models.recursive_reasoning.core_prior import (
+            RULE_FACTOR_INDEX,
+            evidence_rule_factors,
+        )
+        side = int(math.isqrt(seq_len))
+        with torch.no_grad():
+            ci_cpu = ci.detach().to("cpu", torch.long)
+            co_cpu = co.detach().to("cpu", torch.long)
+            ti_cpu = ti.detach().to("cpu", torch.long)
+            cm_cpu = (cm.detach().to("cpu", torch.bool)
+                      if cm is not None else torch.ones(ci.shape[:2], dtype=torch.bool))
+            support_sig, support_sig_valid = cell_conditioning_signature(
+                ci_cpu.reshape(-1, seq_len), side)
+            support_sig = support_sig.view(batch_size, ci.shape[1], seq_len, -1)
+            support_sig_valid = support_sig_valid.view(batch_size, ci.shape[1], seq_len)
+            target_sig, target_valid = cell_conditioning_signature(ti_cpu, side)
+
+            routes = []
+            same_extents = []
+            hist_changes = []
+            movements = []
+            collision_total = 0
+            tau = float(getattr(self.config, "c2_value_backoff_tau", 3.0))
+            for b in range(batch_size):
+                demo_mask = cm_cpu[b]
+                support_valid = (
+                    support_sig_valid[b]
+                    & (co_cpu[b] >= 2)
+                    & demo_mask.unsqueeze(-1)
+                )
+                support_changed = support_valid & (ci_cpu[b] != co_cpu[b])
+                bind = hierarchical_value_binding(
+                    support_sig[b],
+                    (co_cpu[b] - 2).clamp(0, 9),
+                    support_valid,
+                    support_changed,
+                    target_sig[b],
+                    target_valid[b],
+                    tau=tau,
+                )
+                keep = demo_mask.nonzero(as_tuple=True)[0]
+                if keep.numel() > 0:
+                    factors = evidence_rule_factors(
+                        ci_cpu[b][keep], co_cpu[b][keep], side)
+                    scores = factors["scores"].float()
+                    p_same_extent = float(scores[RULE_FACTOR_INDEX["extent_same"]])
+                    p_hist_change = float(scores[RULE_FACTOR_INDEX["colour_recolour"]])
+                    p_movement = float(sum(
+                        scores[RULE_FACTOR_INDEX[name]]
+                        for name in ("move_up", "move_down", "move_left", "move_right")
+                    ).clamp(0.0, 1.0))
+                else:
+                    p_same_extent = p_hist_change = p_movement = 0.0
+                route = max(0.0, min(1.0, p_same_extent * p_hist_change * (1.0 - p_movement)))
+                # P1: raw normalized distribution -- NO route multiply, NO route>0 support gating.
+                # Route rides separately as task-level applicability confidence.
+                distribution[b] = bind["distribution"].to(device)
+                marginal[b] = bind["marginal_distribution"].to(device)
+                route_map[b] = route
+                reliability[b] = bind["support_reliability"].to(device)
+                target_is_valid = target_valid[b].to(device)
+                changed_supported[b] = bind["changed_supported"].to(device) & target_is_valid
+                copy_supported[b] = bind["copy_supported"].to(device) & target_is_valid
+                supported[b] = changed_supported[b] | copy_supported[b]
+                routes.append(route)
+                same_extents.append(p_same_extent)
+                hist_changes.append(p_hist_change)
+                movements.append(p_movement)
+                collision_total += int(bind["collision_count"])
+
+            def mean_scalar(values: list[float]) -> torch.Tensor:
+                return torch.tensor(sum(values) / max(len(values), 1), device=device)
+
+            stats["c2_canonical_bind_same_position_route"] = mean_scalar(routes)
+            stats["c2_canonical_bind_same_extent"] = mean_scalar(same_extents)
+            stats["c2_canonical_bind_histogram_change"] = mean_scalar(hist_changes)
+            stats["c2_canonical_bind_movement"] = mean_scalar(movements)
+            valid_target = ti.to(device) >= 2
+            stats["c2_canonical_bind_support_coverage"] = (
+                supported.float().sum() / valid_target.float().sum().clamp_min(1.0))
+            stats["c2_canonical_bind_changed_support_coverage"] = (
+                changed_supported.float().sum() / valid_target.float().sum().clamp_min(1.0))
+            stats["c2_canonical_bind_copy_support_coverage"] = (
+                copy_supported.float().sum() / valid_target.float().sum().clamp_min(1.0))
+            stats["c2_canonical_bind_key_collisions"] = torch.tensor(
+                float(collision_total), device=device)
+        return distribution, stats, supported, changed_supported, copy_supported, per_cell
+
+    @staticmethod
+    def _rule_factor_batch(
+        context_inputs: torch.Tensor,
+        context_outputs: torch.Tensor,
+        context_mask: torch.Tensor,
+        side: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Batch the core-prior independent factor API for neural routing."""
+        from models.recursive_reasoning.core_prior import (
+            RULE_FACTOR_INDEX,
+            evidence_rule_factors,
+        )
+        B = context_inputs.shape[0]
+        scores = torch.zeros((B, RULE_FACTOR_DIM), device=device, dtype=torch.float32)
+        # Missing support defaults to the conservative identity route.
+        for name in ("extent_same", "colour_copy", "move_none", "count_preserved"):
+            scores[:, RULE_FACTOR_INDEX[name]] = 1.0
+        spatial = torch.zeros((B, 8), device=device, dtype=torch.float32)
+        ci = context_inputs.detach().to("cpu", torch.long)
+        co = context_outputs.detach().to("cpu", torch.long)
+        cm = context_mask.detach().to("cpu", torch.bool)
+        with torch.no_grad():
+            for b in range(B):
+                keep = cm[b].nonzero(as_tuple=True)[0]
+                if keep.numel() == 0:
+                    continue
+                result = evidence_rule_factors(ci[b][keep], co[b][keep], side)
+                scores[b] = result["scores"].to(device)
+                spatial[b] = torch.stack((
+                    result["dominant_dy"], result["dominant_dx"],
+                    result["direction_consistency"], result["bbox_dh"], result["bbox_dw"],
+                    result["same_shape_transport"], result["creation_confidence"],
+                    result["deletion_confidence"],
+                )).to(device)
+        stats = {
+            "c2_rule_factor_same_extent": scores[:, RULE_FACTOR_INDEX["extent_same"]].mean().detach(),
+            "c2_rule_factor_recolour": scores[:, RULE_FACTOR_INDEX["colour_recolour"]].mean().detach(),
+            "c2_rule_factor_move": scores[:, [
+                RULE_FACTOR_INDEX["move_up"], RULE_FACTOR_INDEX["move_down"],
+                RULE_FACTOR_INDEX["move_left"], RULE_FACTOR_INDEX["move_right"],
+            ]].sum(dim=-1).clamp(0.0, 1.0).mean().detach(),
+            "c2_rule_factor_match_coverage": spatial[:, 5].mean().detach(),
+            "c2_rule_factor_direction_consistency": spatial[:, 2].mean().detach(),
+        }
+        return scores, stats
+
 
 # ======================================================================================
 # section 7 -- MODEL INIT (heads built FROM THE SCHEMA)   (ROLE: MODEL INIT)
@@ -1230,7 +1803,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                 self.rule_hyp_embed.embedding_weight.zero_()
         # §15.2-A: separate zero-init projection for SUPPORT-side maps fed into C2's demo features.
         # Zero-init => the demo enrichment contributes nothing at step 0 (F7-safe, baseline unchanged).
-        if getattr(self.config, "c2_relmap_demos", False) and getattr(self.config, "c2_relmap", False):
+        if ((getattr(self.config, "c2_relmap_demos", False)
+             or getattr(self.config, "c2_ordered_evidence_flow", False))
+                and getattr(self.config, "c2_relmap", False)):
             self.c2_demo_relmap_proj = CastedLinear(REL_MAP_CHANNELS, self.config.hidden_size, bias=False)
             with torch.no_grad():
                 self.c2_demo_relmap_proj.weight.zero_()
@@ -1242,10 +1817,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             from models.recursive_reasoning.pair_delta_v2 import PairDeltaEncoder as _PDE
             _enc_dim = int(getattr(self.config, "c2_delta_rule_encoder_dim", 256))
             self.pairdelta_input_encoder = _PDE(
-                hidden_dim=_enc_dim, n_slots=int(getattr(self.config, "c2_delta_rule_slots", 8)))
+                hidden_dim=_enc_dim, n_slots=int(getattr(self.config, "c2_delta_rule_slots", 8)),
+                include_identity=bool(getattr(self.config, "c2_pairdelta_include_identity", False)),
+                include_spatial=bool(getattr(self.config, "c2_pairdelta_spatial", False)))
             self.delta_rule_input_proj = CastedLinear(_enc_dim, self.config.hidden_size, bias=False)
             with torch.no_grad():
                 self.delta_rule_input_proj.weight.zero_()
+        if getattr(self.config, "c2_rule_factor_hint", False):
+            self.rule_factor_proj = CastedLinear(RULE_FACTOR_DIM, self.config.hidden_size, bias=False)
+            with torch.no_grad():
+                self.rule_factor_proj.weight.zero_()
         if self.config.c2_dual_output_head or self.config.c2_geometry_aux_head:
             self.structure_head = CastedLinear(self.config.hidden_size, 3, bias=False)
         # §15.6: let structure_head SEE the relmap (zero-init [REL_MAP_CHANNELS->3] proj added to structure
@@ -1309,6 +1890,39 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                 "c2_value_v2_backoff AND c2_value_v2_rich_ctx are both on: backoff takes precedence "
                 "and rich-ctx is silently DEAD. Pick one (this is the A/B variable).",
                 RuntimeWarning, stacklevel=2)
+
+        if getattr(self.config, "c2_canonical_value_binder", False):
+            if int(getattr(self.config, "c2_color_head_mlp_dim", 0)) > 0:
+                raise ValueError(
+                    "c2_canonical_value_binder requires c2_color_head_mlp_dim=0; the MLP would be a "
+                    "second uncalibrated VALUE authority.")
+            conflicting = [
+                name for name, _width, flag in EVIDENCE_COLS
+                if name in _CANONICAL_SUPPRESSED_EVIDENCE
+                and name != "where_hint"
+                and bool(getattr(self.config, flag, False))
+            ]
+            if conflicting:
+                raise ValueError(
+                    "canonical VALUE binding suppresses independent full-colour evidence blocks; "
+                    f"disable these conflicting flags: {', '.join(conflicting)}")
+        if (getattr(self.config, "c2_extent_conditioned_structure", False)
+                and getattr(self.config, "c2_candidate_floor_structure", False)):
+            raise ValueError(
+                "c2_extent_conditioned_structure replaces global candidate-floor-structure; "
+                "the two routes are mutually exclusive.")
+
+        # --- D5 NOT-YET-WIRED GUARD (audit A2): the field parses but NOTHING consumes it -- no
+        #     evidence width, so even the width-drift assert is blind. A parseable no-op flag is
+        #     the V3-1 silent-default disease; refuse outright until the wiring block ships.
+        #     Delete the line the day its consumer lands (D5 -> ranked-frame hint, AFTER the
+        #     File-#7 dataloader flip). D6 c2_algo_where_touch was REMOVED from this guard when
+        #     its consumer (_evidence_algo_touch) landed.
+        for _k in ("c2_frame_hint_ranked",):
+            if getattr(self.config, _k, False):
+                raise ValueError(
+                    f"config.{_k}=True, but this flag is NOT YET WIRED in trm_fvr_v2 (no consumer): "
+                    f"the run would silently test nothing. Unset it, or implement its block first.")
 
         # --- §15.0 V3-CLEAN INVARIANT GUARD (no behaviour change; surfaces config drift) ----------
         self._v3_clean_invariant_check()
@@ -1379,6 +1993,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _ in range(self.config.L_layers)]
         )
 
+        self.register_buffer(
+            "evidence_schema_fingerprint",
+            evidence_schema_fingerprint(self.config),
+            persistent=True,
+        )
+
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
@@ -1431,10 +2051,20 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         added (scaled by the --zh-amp diagnostic, default 1.0 == no-op). Any hint-specific EXTRA metric
         (e.g. nonzero_frac) is added by the caller. Byte-identical to the three former inline copies."""
         _amp = float(getattr(self, "_demo_injection_scale", 1.0))
-        grid_features = grid_features + _amp * vec.unsqueeze(1)
+        residual = _amp * vec.unsqueeze(1).expand(-1, grid_features.shape[1], -1)
+        if getattr(self.config, "c2_bounded_evidence_fusion", False):
+            grid_features, raw_ratio, applied_ratio = bounded_residual(
+                grid_features, residual, float(getattr(self.config, "c2_post_hint_rho", 0.10)))
+        else:
+            grid_features = grid_features + residual
+            raw_ratio = torch.zeros((), device=grid_features.device)
+            applied_ratio = raw_ratio
         with torch.no_grad():
             c2_metrics = dict(c2_metrics)
             c2_metrics[norm_key] = vec.float().norm(dim=-1).mean().detach()
+            if getattr(self.config, "c2_bounded_evidence_fusion", False):
+                c2_metrics[f"{norm_key}_raw_ratio"] = raw_ratio.detach()
+                c2_metrics[f"{norm_key}_applied_ratio"] = applied_ratio.detach()
         return grid_features, c2_metrics
 
     def _maybe_drop_puzzle_ids(self, puzzle_identifiers: torch.Tensor) -> torch.Tensor:
@@ -1470,6 +2100,82 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         grid_features = self.grid_encoder(target_inputs, target_visual_features)
         c2_metrics: Dict[str, torch.Tensor] = {}
         pid_task_vec: torch.Tensor | None = None
+        target_query_features: torch.Tensor | None = None   # P3A Block 1 x_query (isolated lane)
+        ordered_flow = bool(getattr(self.config, "c2_ordered_evidence_flow", False))
+        injection_scale = float(getattr(self, "_demo_injection_scale", 1.0))
+
+        # Ordered V2 path: target relations and support-fitted WHERE predicates must exist before
+        # C2 forms its target queries. The legacy path below remains untouched when the flag is off.
+        if ordered_flow:
+            from models.recursive_reasoning.relation_map import (
+                relational_maps as _ordered_relational_maps,
+                relational_where_hint as _ordered_where_hint,
+            )
+            B, L = target_inputs.shape
+            side = int(math.isqrt(L))
+            if rel_maps is None:
+                rel_maps = _ordered_relational_maps(target_inputs, side=side)
+            if context_inputs is not None and context_rel_maps is None:
+                BM = context_inputs.shape[0] * context_inputs.shape[1]
+                context_rel_maps = _ordered_relational_maps(
+                    context_inputs.reshape(BM, L), side=side).view(
+                        context_inputs.shape[0], context_inputs.shape[1], L, -1)
+            if (context_outputs is not None and context_output_rel_maps is None
+                    and getattr(self, "c2_demo_relmap_proj", None) is not None):
+                BM = context_outputs.shape[0] * context_outputs.shape[1]
+                context_output_rel_maps = _ordered_relational_maps(
+                    context_outputs.reshape(BM, L), side=side).view(
+                        context_outputs.shape[0], context_outputs.shape[1], L, -1)
+
+            rel_maps = rel_maps.to(grid_features.dtype)
+            rel_delta = injection_scale * self.relmap_proj(rel_maps)
+            if getattr(self.config, "c2_bounded_evidence_fusion", False):
+                _relmap_fused, raw_ratio, applied_ratio = bounded_residual(
+                    grid_features, rel_delta, float(getattr(self.config, "c2_target_relmap_rho", 0.10)))
+                c2_metrics["c2_target_relmap_raw_norm_ratio"] = raw_ratio.detach()
+                c2_metrics["c2_target_relmap_applied_norm_ratio"] = applied_ratio.detach()
+            else:
+                _relmap_fused = grid_features + rel_delta
+            if getattr(self.config, "c2_isolated_relmap_query", False):
+                # P3A Block 1: the relmap-enriched features become the C2 QUERY lane only (x_query).
+                # The recurrence keeps x_base = grid_encoder output; target relations may shape the
+                # C2 query and WHERE gate but can no longer write into the recurrent input directly.
+                target_query_features = _relmap_fused
+            else:
+                grid_features = _relmap_fused
+
+            if (getattr(self.config, "c2_rel_where_hint", False)
+                    and context_inputs is not None and context_outputs is not None
+                    and context_mask is not None):
+                where_hint, where_info = _ordered_where_hint(
+                    target_inputs,
+                    context_inputs,
+                    context_outputs,
+                    context_mask,
+                    target_rel_maps=rel_maps.float(),
+                    context_rel_maps=context_rel_maps.float() if context_rel_maps is not None else None,
+                    side=side,
+                    topk=max(1, int(getattr(self.config, "c2_rel_where_topk", 1))),
+                )
+                input_hints["rel_where"] = where_hint.to(grid_features.dtype)
+                c2_metrics["c2_rel_where_confidence"] = (
+                    where_info["rel_where_confidence"].float().mean().detach())
+                c2_metrics["c2_rel_where_f1"] = where_info["rel_where_f1"].float().mean().detach()
+                c2_metrics["c2_rel_where_fpr"] = where_info["rel_where_fpr"].float().mean().detach()
+                c2_metrics["c2_where_support_fit_f1"] = c2_metrics["c2_rel_where_f1"]
+                c2_metrics["c2_where_support_fit_fpr"] = c2_metrics["c2_rel_where_fpr"]
+
+        rule_factor_scores = None
+        if (context_inputs is not None and context_outputs is not None and context_mask is not None
+                and (getattr(self.config, "c2_rule_factor_hint", False)
+                     or getattr(self.config, "c2_object_pair_tokens", False)
+                     or getattr(self.config, "c2_extent_conditioned_structure", False))):
+            rule_factor_scores, rule_factor_stats = self._rule_factor_batch(
+                context_inputs, context_outputs, context_mask,
+                int(math.isqrt(target_inputs.shape[-1])), grid_features.device)
+            input_hints["rule_factors"] = rule_factor_scores.to(grid_features.dtype)
+            c2_metrics.update(rule_factor_stats)
+
         if self.c2 is not None and context_inputs is not None and context_outputs is not None and context_mask is not None:
             context_input_features = self.grid_encoder(context_inputs, context_input_visual_features)
             context_output_features = self.grid_encoder(context_outputs, context_output_visual_features)
@@ -1484,24 +2190,54 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                         context_rel_maps = _rm(context_inputs.reshape(_B * _M, _L), side=_side).view(_B, _M, _L, -1)
                     if context_output_rel_maps is None:
                         context_output_rel_maps = _rm(context_outputs.reshape(_B * _M, _L), side=_side).view(_B, _M, _L, -1)
-                context_input_features = context_input_features + self.c2_demo_relmap_proj(
+                _support_in_delta = injection_scale * self.c2_demo_relmap_proj(
                     context_rel_maps.to(context_input_features.dtype))
-                context_output_features = context_output_features + self.c2_demo_relmap_proj(
+                _support_out_delta = injection_scale * self.c2_demo_relmap_proj(
                     context_output_rel_maps.to(context_output_features.dtype))
-            grid_features, c2_metrics, pid_task_vec = self.c2(
+                if getattr(self.config, "c2_bounded_evidence_fusion", False):
+                    context_input_features, _sir, _sia = bounded_residual(
+                        context_input_features, _support_in_delta,
+                        float(getattr(self.config, "c2_target_relmap_rho", 0.10)))
+                    context_output_features, _sor, _soa = bounded_residual(
+                        context_output_features, _support_out_delta,
+                        float(getattr(self.config, "c2_target_relmap_rho", 0.10)))
+                    c2_metrics["c2_support_input_relmap_raw_norm_ratio"] = _sir.detach()
+                    c2_metrics["c2_support_input_relmap_applied_norm_ratio"] = _sia.detach()
+                    c2_metrics["c2_support_output_relmap_raw_norm_ratio"] = _sor.detach()
+                    c2_metrics["c2_support_output_relmap_applied_norm_ratio"] = _soa.detach()
+                else:
+                    context_input_features = context_input_features + _support_in_delta
+                    context_output_features = context_output_features + _support_out_delta
+            grid_features, _c2_runtime_metrics, pid_task_vec = self.c2(
                 target_features=grid_features,
                 context_inputs=context_inputs,
                 context_outputs=context_outputs,
                 context_input_features=context_input_features,
                 context_output_features=context_output_features,
                 context_mask=context_mask,
+                target_where_hint=input_hints.get("rel_where") if ordered_flow else None,
+                rule_factors=rule_factor_scores,
+                target_query_features=target_query_features,
             )
+            c2_metrics = {**c2_metrics, **_c2_runtime_metrics}
+        if getattr(self.config, "c2_rule_factor_hint", False) and rule_factor_scores is not None:
+            rule_hint = self.rule_factor_proj(rule_factor_scores.to(grid_features.dtype))
+            grid_features, c2_metrics = self._add_broadcast_hint(
+                grid_features, rule_hint, "c2_rule_factor_hint_norm", c2_metrics)
         # §15.2-B: PairDelta as an INPUT-ONLY hint -- broadcast the learned cross-demo rule_vec to all
         # cells (zero-init proj => no-op at step 0). Pure input evidence; the TRM recurrence fuses it.
         if (getattr(self, "pairdelta_input_encoder", None) is not None
                 and context_inputs is not None and context_outputs is not None and context_mask is not None):
             _pd = self.pairdelta_input_encoder(context_inputs, context_outputs, context_mask)
             _vec = _pd["rule_vec"]
+            if getattr(self.config, "c2_pairdelta_spatial", False):
+                with torch.no_grad():
+                    c2_metrics = dict(c2_metrics)
+                    c2_metrics["c2_pairdelta_spatial_feature_norm"] = (
+                        _pd["spatial_feature_norm"].float().detach())
+                    _spatial_denom = context_mask.float().sum().clamp_min(1.0)
+                    c2_metrics["c2_pairdelta_spatial_valid_rate"] = (
+                        _pd["spatial_valid"].float().sum() / _spatial_denom).detach()
             if getattr(self.config, "c2_pairdelta_input_conf_gate", False):
                 # SS7 reuse #2: rule_confidence was DEAD in this lane. Gating the broadcast by it makes
                 # low-signal tasks shrink the hint instead of feeding the norm growth that breaks
@@ -1535,16 +2271,20 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             and context_outputs is not None
             and context_mask is not None
         ):
-            grid_features, visual_rule_metrics = self.visual_rule_adapter(
-                base_features=grid_features,
+            pre_visual_features = grid_features
+            adapted_features, visual_rule_metrics = self.visual_rule_adapter(
+                base_features=pre_visual_features,
                 target_inputs=target_inputs,
                 context_inputs=context_inputs,
                 context_outputs=context_outputs,
                 context_mask=context_mask,
             )
+            grid_features = pre_visual_features + injection_scale * (
+                adapted_features - pre_visual_features)
             c2_metrics = dict(c2_metrics)
             c2_metrics.update(visual_rule_metrics)
-        if getattr(self.config, "c2_relmap", False) and target_inputs is not None:
+        if (getattr(self.config, "c2_relmap", False) and target_inputs is not None
+                and not ordered_flow):
             if rel_maps is None:
                 # Fallback: compute inline if not pre-computed in the dataloader.
                 if not getattr(self, "_relmap_fallback_warned", False):
@@ -1560,7 +2300,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                 _side = int(math.isqrt(target_inputs.shape[-1]))
                 rel_maps = _compute_relational_maps(target_inputs, side=_side)
             rel_maps = rel_maps.to(grid_features.dtype)
-            grid_features = grid_features + self.relmap_proj(rel_maps)
+            grid_features = grid_features + injection_scale * self.relmap_proj(rel_maps)
             if (getattr(self.config, "c2_rel_where_hint", False)
                     and context_inputs is not None and context_outputs is not None and context_mask is not None):
                 from models.recursive_reasoning.relation_map import relational_where_hint   # M11
@@ -1581,11 +2321,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                         _where_info["rel_where_confidence"].float().mean().detach())
                     c2_metrics["c2_rel_where_f1"] = (_where_info["rel_where_f1"].float().mean().detach())
                     c2_metrics["c2_rel_where_fpr"] = (_where_info["rel_where_fpr"].float().mean().detach())
+                    c2_metrics["c2_where_support_fit_f1"] = c2_metrics["c2_rel_where_f1"]
+                    c2_metrics["c2_where_support_fit_fpr"] = c2_metrics["c2_rel_where_fpr"]
 
         # Lane B: broadcast-add the FRAME-family hint embedding (zero at init -> F7-safe). Independent of
         # c2_relmap so the rule-hypothesis bus can be A/B'd on its own.
         if getattr(self.config, "c2_frame_hint", False) and frame_label is not None and hasattr(self, "frame_embed"):
             fe = self.frame_embed(frame_label.to(torch.long)).to(grid_features.dtype)     # [B, hidden]
+            fe = fe * (frame_label != 0).to(fe.dtype).unsqueeze(-1)
             grid_features, c2_metrics = self._add_broadcast_hint(
                 grid_features, fe, "c2_frame_hint_norm", c2_metrics)                       # M8
             with torch.no_grad():
@@ -1615,6 +2358,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                         fam_idx[b] = RULE_FAMILY_INDEX.get(ranked[0]["family"], 0)
             fam_idx = fam_idx.to(grid_features.device)
             rh = self.rule_hyp_embed(fam_idx).to(grid_features.dtype)                     # [B, hidden]
+            rh = rh * (fam_idx != 0).to(rh.dtype).unsqueeze(-1)
             grid_features, c2_metrics = self._add_broadcast_hint(
                 grid_features, rh, "c2_rule_hyp_norm", c2_metrics)                         # M8
             with torch.no_grad():
@@ -1673,7 +2417,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             ):
                 modulation = self.pid_task_modulator(pid_task_vec).to(puzzle_embedding.dtype)
                 gate = torch.tanh(self.pid_task_gate).to(puzzle_embedding.dtype)
-                puzzle_embedding = puzzle_embedding + gate * modulation
+                injection_scale = float(getattr(self, "_demo_injection_scale", 1.0))
+                puzzle_embedding = puzzle_embedding + injection_scale * gate * modulation
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
@@ -1723,8 +2468,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
 
     # ---------------------------------------------------------------------------- §8 LODO machinery
     def _build_lodo_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor] | None:
+        force_marker = batch.get("_force_lodo_eval", False)
+        if torch.is_tensor(force_marker):
+            expected = batch["inputs"].shape[:1]
+            if force_marker.shape != expected or force_marker.dtype != torch.bool:
+                raise ValueError("_force_lodo_eval must be a Bool tensor with shape [B]")
+            force_lodo_eval = bool(force_marker.all())
+        else:
+            force_lodo_eval = bool(force_marker)
         if (
-            not self.training
+            (not self.training and not force_lodo_eval)
             or self.c2 is None
             or (self.config.c2_leave_one_demo_weight <= 0
                 and not getattr(self.config, "c2_lodo_force_build", False))
@@ -1738,18 +2491,41 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         if not aux_valid.any():
             return None
 
-        max_samples = int(self.config.c2_lodo_max_samples)
-        if max_samples > 0:
-            valid_indices = torch.nonzero(aux_valid, as_tuple=False).flatten()
-            if valid_indices.numel() > max_samples:
-                selected = valid_indices[torch.randperm(valid_indices.numel(), device=valid_indices.device)[:max_samples]]
-                limited_valid = torch.zeros_like(aux_valid)
-                limited_valid[selected] = True
-                aux_valid = limited_valid
+        contract_valid = batch.get("_lodo_aux_valid")
+        if contract_valid is not None:
+            if not torch.is_tensor(contract_valid) or contract_valid.shape != aux_valid.shape:
+                raise ValueError("_lodo_aux_valid must be a Bool tensor with shape [B]")
+            contract_valid = contract_valid.to(device=aux_valid.device, dtype=torch.bool)
+            if bool((contract_valid & ~aux_valid).any()):
+                raise ValueError("_lodo_aux_valid selected a row with fewer than two valid demonstrations")
+            aux_valid = aux_valid & contract_valid
+        else:
+            max_samples = int(self.config.c2_lodo_max_samples)
+            if max_samples > 0:
+                valid_indices = torch.nonzero(aux_valid, as_tuple=False).flatten()
+                if valid_indices.numel() > max_samples:
+                    selected = valid_indices[
+                        torch.randperm(valid_indices.numel(), device=valid_indices.device)[:max_samples]]
+                    limited_valid = torch.zeros_like(aux_valid)
+                    limited_valid[selected] = True
+                    aux_valid = limited_valid
 
-        random_scores = torch.rand(context_mask.shape, device=context_mask.device)
-        random_scores = random_scores.masked_fill(~context_mask, -1)
-        holdout_idx = random_scores.argmax(dim=-1)
+        contract_holdout = batch.get("_lodo_holdout_idx")
+        if contract_holdout is not None:
+            if not torch.is_tensor(contract_holdout) or contract_holdout.shape != valid_counts.shape:
+                raise ValueError("_lodo_holdout_idx must be a Long tensor with shape [B]")
+            if contract_holdout.dtype != torch.long:
+                raise ValueError("_lodo_holdout_idx must be a Long tensor with shape [B]")
+            holdout_idx = contract_holdout.to(device=context_mask.device, dtype=torch.long)
+            if bool(((holdout_idx < 0) | (holdout_idx >= context_mask.shape[1])).any()):
+                raise ValueError("_lodo_holdout_idx contains an out-of-range demonstration index")
+            chosen_is_valid = context_mask.gather(1, holdout_idx.view(-1, 1)).squeeze(1)
+            if bool((aux_valid & ~chosen_is_valid).any()):
+                raise ValueError("_lodo_holdout_idx selected a masked demonstration")
+        else:
+            random_scores = torch.rand(context_mask.shape, device=context_mask.device)
+            random_scores = random_scores.masked_fill(~context_mask, -1)
+            holdout_idx = random_scores.argmax(dim=-1)
 
         gather_index = holdout_idx.view(-1, 1, 1).expand(-1, 1, batch["context_inputs"].shape[-1])
         aux_inputs = batch["context_inputs"].gather(1, gather_index).squeeze(1)
@@ -1795,16 +2571,29 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         if (self.config.c2_lodo_contrast_weight > 0
                 or getattr(self.config, "c2_lodo_force_shuffle", False)) and row_indices.numel() > 0:
             source_puzzle_identifiers = batch["puzzle_identifiers"]
-            source_has_context = context_mask.any(dim=-1)
+            correct_counts = aux_context_mask[row_indices].sum(dim=-1)
+            source_counts = context_mask.sum(dim=-1)
+            source_has_context = source_counts > 0
             wrong_candidates = (
                 source_puzzle_identifiers.unsqueeze(0) != aux_puzzle_identifiers.unsqueeze(1)
             ) & source_has_context.unsqueeze(0)
+            if getattr(self.config, "c2_positive_where_gate", False):
+                wrong_candidates = wrong_candidates & (
+                    source_counts.unsqueeze(0) >= correct_counts.unsqueeze(1))
             shuffle_valid = wrong_candidates.any(dim=-1)
             if shuffle_valid.any():
                 wrong_scores = torch.rand(wrong_candidates.shape, device=wrong_candidates.device)
                 wrong_scores = wrong_scores.masked_fill(~wrong_candidates, -1)
                 shuffle_src = wrong_scores.argmax(dim=-1)
                 shuffle_context_mask = batch["context_mask"][shuffle_src]
+                if getattr(self.config, "c2_positive_where_gate", False):
+                    # Matched-count contrast: select exactly the same number of demos as the correct
+                    # LODO fold. Stable first-valid selection keeps the comparison deterministic.
+                    source_valid = shuffle_context_mask.to(torch.bool)
+                    order = source_valid.long().cumsum(dim=-1)
+                    shuffle_context_mask = (
+                        source_valid & (order <= correct_counts.unsqueeze(-1))
+                    ).to(batch["context_mask"].dtype)
 
         def _rows(key: str) -> torch.Tensor:      # correct-task per-demo tensor for the LODO rows
             return batch[key][row_indices]
@@ -1865,7 +2654,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             prefix = "context_inputs" if base_key == context_inputs_key else "context_outputs"
             return aux_batch.get(base_key.replace(prefix, feature))
 
-        grid_features, _, pid_task_vec, rel_maps, aux_input_hints = self._condition_grid_features(
+        grid_features, aux_c2_metrics, pid_task_vec, rel_maps, aux_input_hints = self._condition_grid_features(
             target_inputs=aux_batch["inputs"],
             target_visual_features=aux_batch.get("input_visual_features"),
             context_inputs=aux_batch[context_inputs_key],
@@ -1894,6 +2683,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         if active_rel_maps is not None:
             aux_batch["_active_context_rel_maps"] = active_rel_maps
         logits, extra_outputs = self._output_logits(z_H, aux_batch, rel_maps=rel_maps, input_hints=aux_input_hints)
+        if "c2_gate_where_values" in aux_c2_metrics:
+            extra_outputs["c2_gate_where_values"] = aux_c2_metrics["c2_gate_where_values"]
         if (
             getattr(self.config, "c2_floor_candidate_split", False)
             and "c2_candidate_logits" in extra_outputs
@@ -1981,6 +2772,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         color_logits: torch.Tensor,
         palette_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """Soft (or hard) suppression of colours absent from the task palette, applied to COLOUR logits.
+
+        M6 SCOPE NOTE (the silent semantic this docstring exists to kill): this bias is applied ONLY
+        inside `_color_logits` -- the MAIN colour lane. The quarantine CANDIDATE lane
+        (`_quarantine_logits`) receives the palette purely as a FEATURE column (QUARANTINE_COLS
+        "palette"), never through this bias: running `--task-palette-bias` with
+        `--quarantine-candidate` does NOT palette-constrain the candidate's colours. If that is ever
+        wanted, add an explicit `c2_quarantine_palette_bias` flag rather than widening this one."""
         disallowed = ~palette_mask[:, None, :]
         if getattr(self.config, "c2_task_palette_hard", False):
             return color_logits.masked_fill(disallowed, torch.finfo(color_logits.dtype).min)
@@ -2190,10 +2989,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         colour/quarantine stages reuse. `ev` carries task_palette, the three input hints, value_v2 (+its
         stats/logits) and algo_maps. D-blocks (value_ctx_gate/verified_frame/analogy) append here in
         Block 8; until then their flags stay off and evidence_total excludes them."""
-        use_palette_feature = bool(getattr(self.config, "c2_task_palette_feature", False))
+        canonical_binder = bool(getattr(self.config, "c2_canonical_value_binder", False))
+        use_palette_feature = bool(getattr(self.config, "c2_task_palette_feature", False)) and not canonical_binder
         use_palette_bias = bool(getattr(self.config, "c2_task_palette_bias", False))
-        use_rel_where_hint = bool(getattr(self.config, "c2_rel_where_hint", False))
-        use_pairdelta_intent_hint = bool(getattr(self.config, "c2_pairdelta_intent_hint", False))
+        need_rel_where_hint = bool(getattr(self.config, "c2_rel_where_hint", False))
+        use_rel_where_hint = need_rel_where_hint and not canonical_binder
+        use_pairdelta_intent_hint = (
+            bool(getattr(self.config, "c2_pairdelta_intent_hint", False)) and not canonical_binder)
         task_palette = None
         if use_palette_feature or use_palette_bias:
             task_palette = self._task_palette_mask(batch, grid_z.shape[0], grid_z.device)
@@ -2220,14 +3022,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             assert task_palette is not None
             evidence_parts.append(task_palette[:, None, :].expand(-1, grid_z.shape[1], -1).to(grid_z.dtype))
         rel_where_hint = None
-        if use_rel_where_hint:
+        if need_rel_where_hint:
             rel_where_hint = input_hints.get("rel_where")
             if rel_where_hint is None:
                 _wk = max(1, int(getattr(self.config, "c2_rel_where_topk", 1)))
                 rel_where_hint = torch.zeros((*grid_z.shape[:2], _wk), device=grid_z.device, dtype=grid_z.dtype)
             else:
                 rel_where_hint = rel_where_hint.to(grid_z.dtype)
-            evidence_parts.append(rel_where_hint)
+            if use_rel_where_hint:
+                evidence_parts.append(rel_where_hint)
         pairdelta_intent_hint = None
         if use_pairdelta_intent_hint:
             pairdelta_intent_hint = input_hints.get("pairdelta_intent")
@@ -2237,7 +3040,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                 pairdelta_intent_hint = pairdelta_intent_hint.to(grid_z.dtype)
             evidence_parts.append(pairdelta_intent_hint[:, None, :].expand(-1, grid_z.shape[1], -1))
         transition_hint = None
-        if getattr(self.config, "c2_transition_hint", False):
+        if getattr(self.config, "c2_transition_hint", False) and not canonical_binder:
             transition_hint = self._transition_hint(batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(transition_hint.to(grid_z.dtype))
         value_v2 = None
@@ -2245,6 +3048,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         value_v2_logits = None
         value_ctx_gate = None
         value_ctx_bind = None
+        value_ctx_bind_logits = None
+        value_ctx_bind_support = None
         # D7/D11 need value_v2's ctx pass even if the value_v2 COLUMNS themselves are off, so compute
         # value_v2 when ANY of the flags is on -- but only APPEND each block under its own flag.
         _need_v2 = (getattr(self.config, "c2_value_evidence_v2", False)
@@ -2262,37 +3067,81 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                     self.color_evidence_proj.weight[:, v2_col_offset:v2_col_offset + VALUE_EVIDENCE_V2_DIM],
                 ).to(grid_z.dtype)
         algo_maps = None
-        if getattr(self.config, "c2_algo_where_maps", False):
+        if getattr(self.config, "c2_algo_where_maps", False) and not canonical_binder:
             algo_maps = self._algo_where_maps(batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(algo_maps.to(grid_z.dtype))
         # --- APPENDED LAST (EVIDENCE_COLS order): the D-blocks, all zero-init in color_evidence_proj so
         #     step-0 logits are byte-identical even when the evidence is NONZERO (the F7 rule). -------
-        if getattr(self.config, "c2_value_ctx_gate", False):                                     # D7
+        if getattr(self.config, "c2_value_ctx_gate", False) and not canonical_binder:            # D7
             assert value_ctx_gate is not None, "c2_value_ctx_gate needs value_v2's ctx pass"
             evidence_parts.append(value_ctx_gate.to(grid_z.dtype))
         verified_frame = None
-        if getattr(self.config, "c2_verified_frame_evidence", False):                            # D1 / E-1
+        if getattr(self.config, "c2_verified_frame_evidence", False) and not canonical_binder:   # D1 / E-1
             verified_frame = self._evidence_verified_frame(batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(verified_frame.to(grid_z.dtype))
         analogy = None
-        if getattr(self.config, "c2_analogy_evidence", False):                                   # D2 / E-2
+        if getattr(self.config, "c2_analogy_evidence", False) and not canonical_binder:          # D2 / E-2
             analogy = self._evidence_analogy(batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(analogy.to(grid_z.dtype))
         pd_color = None
         pd_color_stats: Dict[str, torch.Tensor] = {}
-        if getattr(self.config, "c2_pairdelta_color_evidence", False):                           # D8 (File #5)
+        if getattr(self.config, "c2_pairdelta_color_evidence", False) and not canonical_binder:  # D8 (File #5)
             pd_color, pd_color_stats = self._evidence_pd_color(
                 batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(pd_color.to(grid_z.dtype))
         pd_bidi = None
         pd_bidi_stats: Dict[str, torch.Tensor] = {}
-        if getattr(self.config, "c2_pairdelta_bidi_evidence", False):                            # D10 (SS7)
+        if getattr(self.config, "c2_pairdelta_bidi_evidence", False) and not canonical_binder:   # D10 (SS7)
             pd_bidi, pd_bidi_stats = self._evidence_pd_bidi(
                 batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
             evidence_parts.append(pd_bidi.to(grid_z.dtype))
-        if getattr(self.config, "c2_value_ctx_bind", False):                                     # D11 (codex)
+        if getattr(self.config, "c2_value_ctx_bind", False) and not canonical_binder:            # D11 (codex)
             assert value_ctx_bind is not None, "c2_value_ctx_bind needs value_v2's ctx pass"
             evidence_parts.append(value_ctx_bind.to(grid_z.dtype))
+            _bind_loc = evidence_slice(self.config, "value_ctx_bind")
+            assert _bind_loc is not None and int(_bind_loc[1]) == int(value_ctx_bind.shape[-1]), (
+                "value_ctx_bind evidence schema is inconsistent with the emitted tensor")
+            _bind_off, _bind_width = int(_bind_loc[0]), int(_bind_loc[1])
+            value_ctx_bind_logits = F.linear(
+                value_ctx_bind.to(self.color_evidence_proj.weight.dtype),
+                self.color_evidence_proj.weight[:, _bind_off:_bind_off + _bind_width],
+            ).to(grid_z.dtype)
+            value_ctx_bind_support = value_ctx_bind.abs().sum(dim=-1) > 0
+        algo_touch = None
+        if getattr(self.config, "c2_algo_where_touch", False) and not canonical_binder:          # D6 (B13)
+            algo_touch = self._evidence_algo_touch(batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
+            evidence_parts.append(algo_touch.to(grid_z.dtype))
+        kinematic = None
+        kin_stats: Dict[str, torch.Tensor] = {}
+        if getattr(self.config, "c2_kinematic_evidence", False) and not canonical_binder:        # E-5 (A3)
+            kinematic, kin_stats = self._evidence_kinematic(
+                batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
+            evidence_parts.append(kinematic.to(grid_z.dtype))
+        canonical_bind = None
+        canonical_bind_stats: Dict[str, torch.Tensor] = {}
+        canonical_bind_logits = None
+        canonical_bind_support = None
+        canonical_bind_changed_support = None
+        canonical_bind_copy_support = None
+        canonical_bind_per_cell: Dict[str, torch.Tensor] = {}
+        if canonical_binder:
+            (
+                canonical_bind,
+                canonical_bind_stats,
+                canonical_bind_support,
+                canonical_bind_changed_support,
+                canonical_bind_copy_support,
+                canonical_bind_per_cell,
+            ) = self._canonical_value_binding(batch, grid_z.shape[0], grid_z.shape[1], grid_z.device)
+            evidence_parts.append(canonical_bind.to(grid_z.dtype))
+            _canonical_loc = evidence_slice(self.config, "canonical_bind")
+            assert _canonical_loc is not None and int(_canonical_loc[1]) == 10
+            _canonical_off, _canonical_width = map(int, _canonical_loc)
+            canonical_bind_logits = F.linear(
+                canonical_bind.to(self.color_evidence_proj.weight.dtype),
+                self.color_evidence_proj.weight[
+                    :, _canonical_off:_canonical_off + _canonical_width],
+            ).to(grid_z.dtype)
         ev = SimpleNamespace(
             task_palette=task_palette, use_palette_bias=use_palette_bias,
             rel_where_hint=rel_where_hint, pairdelta_intent_hint=pairdelta_intent_hint,
@@ -2300,7 +3149,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             value_v2_logits=value_v2_logits, algo_maps=algo_maps,
             value_ctx_gate=value_ctx_gate, verified_frame=verified_frame, analogy=analogy,
             pd_color=pd_color, pd_color_stats=pd_color_stats,
-            pd_bidi=pd_bidi, pd_bidi_stats=pd_bidi_stats, value_ctx_bind=value_ctx_bind)
+            pd_bidi=pd_bidi, pd_bidi_stats=pd_bidi_stats, value_ctx_bind=value_ctx_bind,
+            value_ctx_bind_logits=value_ctx_bind_logits,
+            value_ctx_bind_support=value_ctx_bind_support,
+            algo_touch=algo_touch, kinematic=kinematic, kin_stats=kin_stats,
+            canonical_bind=canonical_bind, canonical_bind_stats=canonical_bind_stats,
+            canonical_bind_logits=canonical_bind_logits,
+            canonical_bind_support=canonical_bind_support,
+            canonical_bind_changed_support=canonical_bind_changed_support,
+            canonical_bind_copy_support=canonical_bind_copy_support,
+            canonical_bind_marginal=canonical_bind_per_cell.get("marginal"),
+            canonical_bind_route=canonical_bind_per_cell.get("route"),
+            canonical_bind_reliability=canonical_bind_per_cell.get("reliability"))
         return evidence_parts, ev
 
     def _color_logits(self, grid_z: torch.Tensor, evidence_parts: list, ev: SimpleNamespace) -> torch.Tensor:
@@ -2328,6 +3188,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         batch: Dict[str, torch.Tensor] | None,
         batch_rel_maps: torch.Tensor | None,
         floor_logits: torch.Tensor,
+        input_hints: Dict[str, torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """PAD/EOS/VALID logits: structure-from-lmhead (§15.8) or the fresh structure_head, + zero-init
         relmap proj (§15.6) + D9 pair-delta family masks (File #5) + the extent PAD/EOS near-hard levers
@@ -2379,6 +3240,22 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                         structure_logits = structure_logits + self.structure_eos_proj(
                             (eos_mask * conf_col).to(structure_logits.dtype).unsqueeze(-1))
                         eos_conf = conf.float().mean().detach()
+        if getattr(self.config, "c2_extent_conditioned_structure", False):
+            fl = floor_logits.to(torch.float32)
+            floor_structure = torch.cat((
+                fl[..., 0:1],
+                fl[..., 1:2],
+                torch.logsumexp(fl[..., 2:12], dim=-1, keepdim=True),
+            ), dim=-1).to(structure_logits.dtype)
+            factors = (input_hints or {}).get("rule_factors")
+            if factors is None:
+                p_same_extent = torch.ones(
+                    structure_logits.shape[0], device=structure_logits.device, dtype=structure_logits.dtype)
+            else:
+                from models.recursive_reasoning.core_prior import RULE_FACTOR_INDEX
+                p_same_extent = factors[:, RULE_FACTOR_INDEX["extent_same"]]
+            structure_logits = extent_conditioned_structure(
+                floor_structure, structure_logits, p_same_extent)
         return structure_logits, outside_conf, eos_conf, pd_struct_conf
 
     def _quarantine_logits(
@@ -2449,8 +3326,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
 
         evidence_parts, ev = self._collect_evidence(batch, batch_rel_maps, grid_z, input_hints)
         color_logits = self._color_logits(grid_z, evidence_parts, ev)
+        canonical_bind_base_logits = (
+            color_logits - ev.canonical_bind_logits
+            if ev.canonical_bind_logits is not None else None)
         structure_logits, outside_conf, eos_conf, pd_struct_conf = self._structure_logits(
-            z_H, grid_z, batch, batch_rel_maps, floor_logits)
+            z_H, grid_z, batch, batch_rel_maps, floor_logits, input_hints=input_hints)
 
         structure_logp = F.log_softmax(structure_logits.to(torch.float32), dim=-1)
         color_logp = F.log_softmax(color_logits.to(torch.float32), dim=-1)
@@ -2459,6 +3339,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
         q_logits = None
         cand_color_logp = color_logp
         if bool(getattr(self.config, "c2_quarantine_candidate", False)) and split:
+            # M6: palette reaches this lane as a FEATURE only (QUARANTINE_COLS "palette");
+            # --task-palette-bias does NOT bias the candidate colour distribution.
             q_logits = self._quarantine_logits(batch, grid_z, batch_rel_maps, ev)
             cand_color_logp = F.log_softmax(q_logits.to(torch.float32), dim=-1)
 
@@ -2516,6 +3398,27 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
             extras.update({f"c2_{k}": v.detach() for k, v in ev.pd_bidi_stats.items()})
         if ev.value_ctx_bind is not None:                                        # D11 (codex)
             extras["c2_value_ctx_bind_mass"] = ev.value_ctx_bind.abs().sum(-1).mean().detach()
+            extras["c2_value_ctx_bind_logits"] = ev.value_ctx_bind_logits
+            extras["c2_value_ctx_bind_support"] = ev.value_ctx_bind_support
+        if ev.algo_touch is not None:                                            # D6 (B13)
+            # coverage: fraction of cells whose object HAS a touching colour (mode one-hot mass)
+            extras["c2_algo_touch_mass"] = ev.algo_touch[..., 0:10].sum(-1).mean().detach()
+        if ev.kinematic is not None:                                             # E-5 (A3)
+            extras.update({f"c2_{k}": v.detach() for k, v in ev.kin_stats.items()})
+        if ev.canonical_bind is not None:
+            extras.update({k: v.detach() for k, v in ev.canonical_bind_stats.items()})
+            extras["c2_canonical_bind_logits"] = ev.canonical_bind_logits
+            extras["c2_canonical_bind_support"] = ev.canonical_bind_support
+            extras["c2_canonical_bind_changed_support"] = ev.canonical_bind_changed_support
+            extras["c2_canonical_bind_copy_support"] = ev.canonical_bind_copy_support
+            extras["c2_canonical_bind_base_logits"] = canonical_bind_base_logits
+            # P1: raw distribution, K0 marginal, and per-cell route/reliability -- carried
+            # SEPARATELY (route is applicability confidence, never probability mass). The
+            # per-cell route key is distinct from the scalar panel stat of the same concept.
+            extras["c2_canonical_bind_distribution"] = ev.canonical_bind
+            extras["c2_canonical_bind_marginal"] = ev.canonical_bind_marginal
+            extras["c2_canonical_bind_route"] = ev.canonical_bind_route
+            extras["c2_canonical_bind_reliability"] = ev.canonical_bind_reliability
         if pd_struct_conf is not None:                                           # D9 (File #5)
             extras["c2_pd_struct_conf"] = pd_struct_conf
         if q_logits is not None:
@@ -2596,19 +3499,54 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                 device=aux_batch["inputs"].device,
                 dtype=torch.float32,
             ),
+            "c2_aux_positive_where_gate": torch.as_tensor(
+                1.0 if getattr(self.config, "c2_positive_where_gate", False) else 0.0,
+                device=aux_batch["inputs"].device,
+                dtype=torch.float32,
+            ),
         }
         if base_logits_lodo is not None:
             outputs["c2_aux_base_logits"] = base_logits_lodo   # P_off for the Stage-2 KL
         if "c2_value_v2_logits" in aux_extra_outputs:
             outputs["c2_aux_value_v2_logits"] = aux_extra_outputs["c2_value_v2_logits"]
+        if "c2_value_ctx_bind_logits" in aux_extra_outputs:
+            outputs["c2_aux_value_ctx_bind_logits"] = aux_extra_outputs["c2_value_ctx_bind_logits"]
+            outputs["c2_aux_value_ctx_bind_support"] = aux_extra_outputs["c2_value_ctx_bind_support"]
+        if "c2_canonical_bind_logits" in aux_extra_outputs:
+            outputs["c2_aux_canonical_bind_logits"] = aux_extra_outputs["c2_canonical_bind_logits"]
+            outputs["c2_aux_canonical_bind_support"] = aux_extra_outputs["c2_canonical_bind_support"]
+            outputs["c2_aux_canonical_bind_changed_support"] = (
+                aux_extra_outputs["c2_canonical_bind_changed_support"])
+            outputs["c2_aux_canonical_bind_copy_support"] = (
+                aux_extra_outputs["c2_canonical_bind_copy_support"])
+            outputs["c2_aux_canonical_bind_base_logits"] = (
+                aux_extra_outputs["c2_canonical_bind_base_logits"])
+            # P1 extraction inputs (LODO pass): raw distribution, K0 marginal, route, reliability.
+            outputs["c2_aux_canonical_bind_distribution"] = (
+                aux_extra_outputs["c2_canonical_bind_distribution"])
+            outputs["c2_aux_canonical_bind_marginal"] = (
+                aux_extra_outputs["c2_canonical_bind_marginal"])
+            outputs["c2_aux_canonical_bind_route"] = (
+                aux_extra_outputs["c2_canonical_bind_route"])
+            outputs["c2_aux_canonical_bind_reliability"] = (
+                aux_extra_outputs["c2_canonical_bind_reliability"])
+        if "c2_gate_where_values" in aux_extra_outputs:
+            outputs["c2_aux_gate_where_values"] = aux_extra_outputs["c2_gate_where_values"]
         if self.config.c2_lodo_contrast_weight > 0 or getattr(self.config, "c2_lodo_force_shuffle", False):
-            shuffle_logits = self._run_aux_logits(
+            _need_shuffle_extras = bool(self.config.c2_token_gate_where)
+            _shuffle_result = self._run_aux_logits(
                 aux_batch,
                 seq_info,
                 context_inputs_key="shuffle_context_inputs",
                 context_outputs_key="shuffle_context_outputs",
                 context_mask_key="shuffle_context_mask",
+                return_extras=_need_shuffle_extras,
             )
+            if _need_shuffle_extras:
+                shuffle_logits, shuffle_extra_outputs = _shuffle_result
+            else:
+                shuffle_logits = _shuffle_result
+                shuffle_extra_outputs = {}
             outputs.update({
                 "c2_lodo_shuffle_logits": shuffle_logits,
                 "c2_lodo_shuffle_labels": aux_batch["labels"],
@@ -2624,6 +3562,30 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module, C2EvidenceMixin):
                     dtype=torch.float32,
                 ),
             })
+            if "c2_gate_where_values" in shuffle_extra_outputs:
+                outputs["c2_shuffle_gate_where_values"] = shuffle_extra_outputs["c2_gate_where_values"]
+        if getattr(self.config, "c2_lodo_zero_support", False) and self.config.c2_token_gate_where:
+            # P3A Block 3: zero-support counterfactual. Same held-out targets, same context TENSORS,
+            # all-false context mask -- the third arm of the WHERE ladder (correct / matched-count
+            # shuffled / zero). A support-conditioned selector must collapse here; a support-blind
+            # bias scores the same as with correct support. CrossAttention handles the all-false
+            # memory mask (zero-valued all-valid bank through bias-free projections).
+            aux_batch["zero_context_mask"] = torch.zeros_like(aux_batch["context_mask"])
+            _zero_logits, zero_extra_outputs = self._run_aux_logits(
+                aux_batch,
+                seq_info,
+                context_inputs_key="context_inputs",
+                context_outputs_key="context_outputs",
+                context_mask_key="zero_context_mask",
+                return_extras=True,
+            )
+            if "c2_gate_where_values" in zero_extra_outputs:
+                _zero_gate = zero_extra_outputs["c2_gate_where_values"]
+                outputs["c2_zero_gate_where_values"] = _zero_gate
+                outputs["c2_zero_support_valid"] = (
+                    aux_batch["aux_valid"].to(torch.bool)
+                    & torch.isfinite(_zero_gate).all(dim=-1)
+                )
         return outputs
 
     def forward(

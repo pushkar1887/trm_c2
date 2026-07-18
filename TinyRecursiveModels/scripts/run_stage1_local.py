@@ -100,6 +100,10 @@ def main() -> None:
                     help="FIX C: 21 algorithmic WHERE/VALUE evidence columns from cell_conditioning_signature "
                          "cols 11/12 -- enclosed flood-fill flag + enclosing-colour one-hot + nearest-seed-"
                          "colour one-hot. Separate zero-init color_evidence_proj columns, never a writer.")
+    ap.add_argument("--algo-where-touch", action="store_true",
+                    help="D6 (B13 close-out): 14 touch-colour evidence columns from cell_conditioning_signature "
+                         "cols 14/15 -- touch_colour_mode one-hot (10) + distinct-count bucket one-hot (4). "
+                         "The neighbour-conditioned recolor substrate; target-input-only, zero-init, never a writer.")
     ap.add_argument("--pairdelta-intent-hint", action="store_true",
                     help="Fold cheap PairDelta intent diagnostics into the existing V3 color_head as a "
                          "per-task input feature only. PairDelta remains a router/evidence signal, not a solver.")
@@ -152,6 +156,11 @@ def main() -> None:
                          "P(change|src,ctx)*P(dst|src,ctx), copy_value[10] = P(copy|src,ctx)*one_hot(src). "
                          "The linear evidence proj cannot multiply the D7 gate by the value dist itself; "
                          "this hands it the finished recommendation. Zero-init, F7-safe.")
+    ap.add_argument("--kinematic-evidence", action="store_true",
+                    help="[V2 model] E-5/A3: 7 per-cell kinematic columns -- mover mask + signed (dr,dc) "
+                         "(live only under a cross-demo-consistent verified movement binding) + blocked "
+                         "up/down/left/right bits (target-input geometry, always on). The rearrangement "
+                         "family's per-cell substrate. Zero-init, F7-safe. NOT judged by frozen-core LODO.")
     ap.add_argument("--value-v2-aux-weight", type=float, default=0.0,
                     help="Explicit LODO loss on the VALUE-V2-only color_head contribution. This forces the "
                          "new evidence columns to become predictive instead of being ignored by the full "
@@ -420,6 +429,7 @@ def main() -> None:
     arch["c2_rel_where_hint"] = bool(args.rel_where_hint)
     arch["c2_rel_where_topk"] = max(1, int(args.rel_where_topk))
     arch["c2_algo_where_maps"] = bool(args.algo_where_maps)
+    arch["c2_algo_where_touch"] = bool(args.algo_where_touch)   # D6 (B13): touch cols 14/15 evidence
     arch["c2_pairdelta_intent_hint"] = bool(args.pairdelta_intent_hint)
     arch["c2_transition_hint"] = bool(args.transition_hint)
     arch["c2_value_evidence_v2"] = bool(args.value_evidence_v2)
@@ -434,6 +444,7 @@ def main() -> None:
     arch["c2_pairdelta_bidi_evidence"] = bool(args.pairdelta_bidi_evidence)
     arch["c2_pairdelta_input_conf_gate"] = bool(args.pairdelta_input_conf_gate)
     arch["c2_value_ctx_bind"] = bool(args.value_ctx_bind)
+    arch["c2_kinematic_evidence"] = bool(args.kinematic_evidence)   # E-5 (A3): kinematic per-cell facts
     # D11 guard (codex): backoff silently wins over rich-ctx inside the model -- both on means the
     # rich-ctx key is DEAD without a trace (the V3-1 silent-default disease). Refuse outright.
     if args.value_v2_backoff and args.value_v2_rich_ctx:
@@ -638,6 +649,28 @@ def main() -> None:
         print(f"[unified] {_u_stack} @ lr<=1e-5 | "
               f"LODO pad/eos CE {'ON' if _pe_on else 'OFF (pass --lodo-pad-weight/--lodo-eos-weight)'} "
               f"(pad={args.lodo_pad_weight}, eos={args.lodo_eos_weight}) | C2+structure+delta+colour train together")
+
+    # ===== V2-ONLY START-GATE (audit A6) =====
+    # These arch keys exist ONLY in trm_fvr_v2's config; legacy trm_fvr_c2's config silently DROPS
+    # unknown keys (V3-1 class: flag accepted, flag discarded, the run lies about what it tests).
+    # Refuse outright -- same contract as the backoff/rich-ctx conflict guard. Checked AFTER all
+    # arch overrides so yaml-set keys (e.g. D5/D6, which have no driver flag) are caught too.
+    # ADD every future v2-only config key to this tuple when its driver flag lands.
+    _V2_ONLY_KEYS = (
+        "c2_verified_frame_evidence", "c2_analogy_evidence", "c2_value_ctx_gate",
+        "c2_value_v2_backoff", "c2_pairdelta_color_evidence", "c2_pairdelta_structure_evidence",
+        "c2_pairdelta_bidi_evidence", "c2_pairdelta_input_conf_gate", "c2_value_ctx_bind",
+        "c2_algo_where_touch",                           # D6: wired (--algo-where-touch)
+        "c2_kinematic_evidence",                         # E-5: wired (--kinematic-evidence)
+        "c2_frame_hint_ranked",                          # D5: yaml-only, UNWIRED (model refuses)
+    )
+    _arch_name = str(arch.get("name", ""))
+    _v2_set = sorted(k for k in _V2_ONLY_KEYS if arch.get(k))
+    if _v2_set and "trm_fvr_v2" not in _arch_name:
+        raise SystemExit(
+            f"[V2-GUARD] {_v2_set} set, but arch.name={_arch_name or '<missing>'} is NOT the V2 model: "
+            f"the legacy model silently drops these keys, so the run would test NOTHING you asked for. "
+            f"Pass --config config/new_fvr_full_v2_base.yaml (arch recursive_reasoning.trm_fvr_v2).")
 
     config = pretrain.PretrainConfig(**raw)
     loader, meta = pretrain.create_dataloader(
@@ -1515,7 +1548,7 @@ def main() -> None:
         # the frozen batches" was unanswerable from the log. One line fixes that.
         if any(k in m for k in ("c2_pd_color_consensus_mass", "c2_pd_struct_conf",
                                 "c2_pd_bidi_invertibility", "c2_verified_frame_coverage",
-                                "c2_value_ctx_bind_mass")):
+                                "c2_value_ctx_bind_mass", "c2_algo_touch_mass", "c2_kin_conf")):
             print(f"  PDEV  : consensus={g('c2_pd_color_consensus_mass'):.3f} "
                   f"minchg={g('c2_pd_color_min_change'):.3f} "
                   f"pos={g('c2_pd_color_pos_prior'):.3f} "
@@ -1524,6 +1557,9 @@ def main() -> None:
                   f"del={g('c2_pd_bidi_del_rate'):.3f} "
                   f"vframe_cov={g('c2_verified_frame_coverage'):.3f} "
                   f"analogy_cov={g('c2_analogy_coverage'):.3f} "
+                  f"touch={g('c2_algo_touch_mass'):.3f} "
+                  f"kin_conf={g('c2_kin_conf'):.3f} "
+                  f"kin_mover={g('c2_kin_mover_mass'):.3f} "
                   f"in_conf={g('c2_pairdelta_input_conf'):.3f} "
                   f"bind={g('c2_value_ctx_bind_mass'):.3f}")
         if "c2_rule_hyp_norm" in m:
